@@ -1,0 +1,18 @@
+slam_toolbox:
+  ros__parameters:
+    odom_frame: odom
+    base_frame: base_link
+    map_frame: map
+    scan_topic: /scan
+    use_sim_time: false
+    mode: mapping
+
+    # Increase these to handle the 10Hz lag
+    transform_timeout: 0.5          # Give it 500ms to find the TF
+    lookup_transform_timeout: 0.5   # Specifically for the initial lookup
+    tf_buffer_duration: 20.0        # Keep a longer history of TFs
+    
+    # Slow down SLAM to match your TF rate
+    minimum_time_interval: 0.2
+    map_update_interval: 5.0        # Don't stress the CPU with frequent map updates
+    max_laser_range: 6.0 # Adjust to your Lidar's actual range
