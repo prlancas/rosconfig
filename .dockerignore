@@ -1,0 +1,9 @@
+.git
+.github
+*.md
+run.sh
+push.sh
+docker-compose.yml
+terminals
+capture.dat
+*.dat

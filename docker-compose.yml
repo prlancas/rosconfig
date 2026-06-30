@@ -1,0 +1,39 @@
+name: droidal
+
+# Whole robot stack in two containers. `docker compose up` replaces the old
+# "run.sh + docker exec into desktop-full + run each script by hand" dance.
+services:
+  # ESP32 talks micro-ROS over WiFi/UDP; this agent bridges it onto the DDS bus.
+  micro-ros-agent:
+    image: microros/micro-ros-agent:jazzy
+    command: udp4 --port 8888
+    network_mode: host
+    privileged: true
+    volumes:
+      - /dev:/dev
+    restart: unless-stopped
+
+  # Our custom image: lidar driver + odometry/TF bridge + slam_toolbox.
+  droidal:
+    image: ghcr.io/prlancas/droidalros:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: host        # share DDS + the lidar TCP port with the host/agent
+    privileged: true          # needed only for serial /dev access
+    volumes:
+      - /dev:/dev
+      # For live script editing without rebuilding, uncomment this line
+      # (it shadows the baked-in scripts with your working copy):
+      # - ./mnt:/opt/droidal
+    environment:
+      # Default: listen for the ESP32 raw-lidar TCP forwarder on :8080.
+      LIDAR_TCP_PORT: "8080"
+      # For a USB-UART adapter instead, comment the line above and set:
+      # LIDAR_SERIAL: "/dev/ttyUSB0"
+      # LIDAR_BAUD: "115200"
+      # Orientation tuning passed straight to lidar_scan_node.py:
+      # LIDAR_EXTRA_ARGS: "--flip --angle-offset 90"
+    depends_on:
+      - micro-ros-agent
+    restart: unless-stopped

@@ -142,7 +142,9 @@ class LidarScanNode(Node):
             d = (pkt[o + 1] << 8) | pkt[o + 2]
             if d == 0:
                 continue
-            r = d / 1000.0
+            # Delta-2 distance is in 0.25 mm units, so metres = raw * 0.25 / 1000
+            # = raw / 4000. (The old /1000 reported every range 4x too far.)
+            r = d / 4000.0
             if r < self.args.range_min or r > self.args.range_max:
                 continue
             ang = start + k * STEP_DEG

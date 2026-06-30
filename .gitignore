@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Raw LIDAR captures (large; only used for offline --file replay)
+*.dat
+capture.dat
+
+# Cursor terminal scratch files
+terminals/
+
+# SLAM map artifacts (generated at runtime, not source)
+*.pgm
+*.posegraph
+map.yaml
+map.data
