@@ -21,3 +21,6 @@ terminals/
 *.posegraph
 map.yaml
 map.data
+# ...but keep the deliberately-saved map we reload on startup:
+!mnt/droidal_map.posegraph
+!mnt/droidal_map.data

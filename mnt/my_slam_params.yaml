@@ -7,6 +7,14 @@ slam_toolbox:
     use_sim_time: false
     mode: mapping
 
+    # Reload a previously-serialized map on startup and continue mapping from it.
+    # Files live at /opt/droidal/droidal_map.{posegraph,data} (baked from mnt/ at
+    # build time). Re-save with the slam_toolbox/serialize_map service + copy the
+    # files into mnt/. Assumes the robot powers on near the map origin; for robust
+    # relocalization, switch mode to 'localization' (and/or set map_start_pose).
+    map_file_name: /opt/droidal/droidal_map
+    map_start_pose: [0.0, 0.0, 0.0]
+
     # Increase these to handle the 10Hz lag
     transform_timeout: 0.5          # Give it 500ms to find the TF
     lookup_transform_timeout: 0.5   # Specifically for the initial lookup

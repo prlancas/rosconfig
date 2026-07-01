@@ -27,13 +27,19 @@ services:
       # (it shadows the baked-in scripts with your working copy):
       # - ./mnt:/opt/droidal
     environment:
+      # SLAM mode: "localization" loads the saved map (mnt/droidal_map.*) read-only
+      # and relocalizes against it (set the robot's pose with Foxglove's "Publish ->
+      # Pose estimate" tool -> /initialpose). Use "mapping" to build/extend a map.
+      SLAM_MODE: "localization"
       # Default: listen for the ESP32 raw-lidar TCP forwarder on :8080.
       LIDAR_TCP_PORT: "8080"
       # For a USB-UART adapter instead, comment the line above and set:
       # LIDAR_SERIAL: "/dev/ttyUSB0"
       # LIDAR_BAUD: "115200"
-      # Orientation tuning passed straight to lidar_scan_node.py:
-      # LIDAR_EXTRA_ARGS: "--flip --angle-offset 90"
+      # Orientation tuning passed straight to lidar_scan_node.py.
+      # --flip fixes the mirrored rotation; --angle-offset rotates the scan
+      # (CCW degrees) so the robot's heading matches the map.
+      LIDAR_EXTRA_ARGS: "--flip --angle-offset 90"
     depends_on:
       - micro-ros-agent
     restart: unless-stopped

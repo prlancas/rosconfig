@@ -183,11 +183,31 @@ class LidarScanNode(Node):
 # --------------------------------------------------------------------------- #
 #  Raw byte sources (run in a background thread, push into node.feed)
 # --------------------------------------------------------------------------- #
+#  No data for this long on an open connection => assume the peer rebooted and
+#  left a half-open socket (no FIN/RST seen). Drop it and re-accept so the
+#  forwarder's fresh connection gets picked up automatically.
+TCP_IDLE_TIMEOUT = 5.0
+
+
+def _enable_keepalive(sock):
+    """Turn on (and, where supported, tighten) TCP keepalive so a peer that
+    vanishes without a FIN/RST is detected at the OS level in ~10s instead of
+    hours."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, val in (("TCP_KEEPIDLE", 3), ("TCP_KEEPINTVL", 2), ("TCP_KEEPCNT", 3)):
+        o = getattr(socket, opt, None)
+        if o is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, o, val)
+            except OSError:
+                pass
+
+
 def run_tcp(node, port, stop):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
-    srv.listen(1)
+    srv.listen(2)
     srv.settimeout(1.0)
     node.get_logger().info(f"listening for raw lidar bytes on 0.0.0.0:{port}")
     while not stop.is_set():
@@ -198,15 +218,29 @@ def run_tcp(node, port, stop):
         except OSError:
             break
         node.get_logger().info(f"forwarder connected: {addr}")
+        _enable_keepalive(conn)
         conn.settimeout(1.0)
+        last_data = time.time()
         try:
             while not stop.is_set():
                 try:
                     data = conn.recv(8192)
                 except socket.timeout:
+                    # No bytes this second. If the peer has gone quiet for too
+                    # long it's almost certainly a dead/half-open link (e.g. the
+                    # robot rebooted) - drop it so a fresh connection is accepted.
+                    if time.time() - last_data > TCP_IDLE_TIMEOUT:
+                        node.get_logger().warning(
+                            f"no lidar data for {TCP_IDLE_TIMEOUT:.0f}s; dropping "
+                            f"{addr} and waiting for a fresh connection")
+                        break
                     continue
+                except OSError as e:  # noqa: BLE001
+                    node.get_logger().warning(f"connection error from {addr}: {e}")
+                    break
                 if not data:
                     break
+                last_data = time.time()
                 node.feed(data)
         finally:
             conn.close()

@@ -20,6 +20,11 @@ Inside the `droidal` container a launch file starts:
 - **`lidar_scan_node.py`** — parses raw Delta-2 bytes (TCP from the ESP32
   forwarder, or a USB-UART serial port) and publishes `/scan`.
 - **`slam_toolbox`** — online async mapping using `mnt/my_slam_params.yaml`.
+- **`goto_goal.py`** — click-to-navigate: subscribes to `/goal_pose` (publish it
+  from Foxglove's **Publish -> Pose** tool with the 3D panel's fixed frame set to
+  `map`) and drives the robot there via `/cmd_vel`. Simple turn-then-drive
+  controller with no obstacle avoidance (a full Nav2 stack is the planned next
+  step). Speeds are conservative and tunable via ROS parameters.
 - **`foxglove_bridge`** — a websocket server (`:8765`) so you can view the live
   map, laser scan, TF and robot model — and teleop `/cmd_vel` — from the
   [Foxglove](https://foxglove.dev) app (desktop or web). Connect it to
