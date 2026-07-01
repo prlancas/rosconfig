@@ -16,7 +16,8 @@ Everything runs via `docker compose` (two containers):
 1. `micro-ros-agent` — official `microros/micro-ros-agent:jazzy`, `udp4 --port 8888`.
 2. `droidal` — custom image built from `Dockerfile`, runs `launch/bringup.launch.py`:
    - `mnt/droidal_viz.py` — URDF + `/odom` (nav_msgs/Odometry) + `odom->base_link`
-     + wheel/laser TFs from `/odrive_status`. The lidar's mounting orientation is
+     + wheel/laser TFs from `/odrive_status`. Also republishes the ESP's `V:`
+     token as `/battery_voltage` (Float32). The lidar's mounting orientation is
      baked into the `laser_frame` TF here (no scan mutation).
    - `mnt/lidar_scan_node.py` — raw Delta-2 bytes -> `/scan` (published as-is).
    - `slam_toolbox` (async/localization) — params from `mnt/my_slam_params.yaml`.
@@ -34,6 +35,10 @@ Everything runs via `docker compose` (two containers):
      `/waypoint/goto`, `/waypoint/delete` (all `std_msgs/String`); persists
      `{label: {x,y,yaw}}` to `mnt/waypoints.json`; `goto` republishes `/goal_pose`.
      This is the groundwork for "go to the cooker" (Android app + VLM-tagged spots).
+   - `mnt/explorer.py` — opt-in autonomous frontier exploration. Finds `/map`
+     frontiers (numpy) and sends them to Nav2 (`NavigateToPose`) to self-map;
+     blacklists unreachable/timed-out frontiers. Starts DISABLED; toggle with
+     `/explore/enable` (`std_msgs/Bool`). Only useful with `SLAM_MODE=mapping`.
    - `foxglove_bridge` — websocket on `:8765` for headless visualization/teleop
      (connect the Foxglove app to `ws://<host>:8765`). Port overridable via
      `FOXGLOVE_PORT`. This is the debug/visualization surface; a custom product
@@ -108,6 +113,22 @@ was replaced by the compose + custom-image setup above.
   "{data: 'kitchen'}"` saves the current pose; `.../waypoint/goto` "{data:
   'kitchen'}" drives there. Explicit pose (e.g. VLM-tagged):
   `"{data: 'cooker,1.2,2.5,0.0'}"` (label,x,y,yaw). Stored in `mnt/waypoints.json`.
+- **Auto-explore (self-map):** set `SLAM_MODE: "mapping"`, then
+  `ros2 topic pub --once /explore/enable std_msgs/Bool "{data: true}"`. The robot
+  drives Nav2 toward `/map` frontiers until none remain. `"{data: false}"` stops
+  it (cancels the active goal). Keep drive power low while testing. Save the
+  result with `slam_toolbox/serialize_map` (below), then switch back to
+  `localization`. Nav2 + mapping run together, so the map grows as it navigates —
+  that's why localization mode "can't map while navigating" (its map is fixed).
+- **Battery voltage:** `ros2 topic echo /battery_voltage` (Float32), or the web
+  UI's Battery readout. Firmware voltage-compensates the gains, so the base
+  shouldn't need the power slider turned down when fully charged anymore.
+- **"Map looks rotated":** the `map` frame's orientation is set by the robot's
+  heading when mapping starts, so a fresh map can look rotated vs an old one —
+  that's cosmetic. What matters is that walls stay crisp (don't smear) as the
+  robot turns; if they smear, calibrate the `laser_frame` yaw (see below). After
+  the firmware/lidar-TF changes, **rebuild the map** — an old saved map from the
+  previous convention may not line up.
 - **Fix LIDAR orientation** (robot facing wrong way / map mirrored): the mounting
   orientation is baked into the `laser_frame` TF in `mnt/droidal_viz.py` (the
   `t_laser` rotation quaternion, currently roll=pi + yaw=pi/2 to match the

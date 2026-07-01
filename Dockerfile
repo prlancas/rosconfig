@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-jazzy-navigation2 \
         ros-jazzy-nav2-bringup \
         python3-serial \
+        python3-numpy \
     && rm -rf /var/lib/apt/lists/*
 
 ENV DROIDAL_DIR=/opt/droidal

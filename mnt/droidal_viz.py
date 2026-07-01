@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
@@ -121,6 +121,9 @@ class DroidalBridge(Node):
         # nav_msgs/Odometry on /odom: Nav2's controller_server needs this for
         # velocity feedback (TF alone isn't enough).
         self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
+        # Battery voltage forwarded from the ESP's /odrive_status "V:" token, as a
+        # typed topic for monitoring / low-battery return-to-base logic later.
+        self.volt_pub = self.create_publisher(Float32, 'battery_voltage', 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # Odometry State
@@ -142,7 +145,14 @@ class DroidalBridge(Node):
             parts = msg.data.split(' ')
             p_right = float(parts[0].split(':')[1]) # Motor 0
             p_left = float(parts[1].split(':')[1])  # Motor 1
-            
+
+            # Optional "V:<volts>" token appended by the firmware.
+            if len(parts) >= 3 and parts[2].startswith('V:'):
+                try:
+                    self.volt_pub.publish(Float32(data=float(parts[2].split(':')[1])))
+                except (ValueError, IndexError):
+                    pass
+
             now_time = self.get_clock().now()
             now = now_time.to_msg()
 

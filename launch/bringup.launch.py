@@ -11,6 +11,8 @@ container:
   * goal_bridge.py        -> /goal_pose (clicked in Foxglove/Android) -> Nav2
                              NavigateToPose action
   * waypoint_manager.py   -> labeled targets (save/goto by name) persisted to disk
+  * explorer.py           -> opt-in frontier exploration (/explore/enable) that
+                             drives Nav2 to auto-map (SLAM_MODE=mapping)
   * foxglove_bridge       -> websocket on :8765 so a browser/Foxglove app can
                              view /map, /scan, TF + robot model and teleop /cmd_vel
 
@@ -86,6 +88,16 @@ def generate_launch_description():
     # Groundwork for the Android app + VLM-tagged locations.
     waypoint_manager = ExecuteProcess(
         cmd=["python3", os.path.join(PKG_DIR, "waypoint_manager.py")],
+        output="screen",
+        respawn=True,
+        respawn_delay=2.0,
+    )
+
+    # Autonomous frontier exploration (drives Nav2 toward unknown space to build
+    # the map). Starts DISABLED; enable at runtime with `/explore/enable` (Bool).
+    # Only useful with SLAM_MODE=mapping.
+    explorer = ExecuteProcess(
+        cmd=["python3", os.path.join(PKG_DIR, "explorer.py")],
         output="screen",
         respawn=True,
         respawn_delay=2.0,
@@ -255,4 +267,5 @@ def generate_launch_description():
         # Goal delivery + labeled targets
         goal_bridge,
         waypoint_manager,
+        explorer,
     ])

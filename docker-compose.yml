@@ -27,9 +27,14 @@ services:
       # (it shadows the baked-in scripts with your working copy):
       # - ./mnt:/opt/droidal
     environment:
-      # SLAM mode: "localization" loads the saved map (mnt/droidal_map.*) read-only
-      # and relocalizes against it (set the robot's pose with Foxglove's "Publish ->
-      # Pose estimate" tool -> /initialpose). Use "mapping" to build/extend a map.
+      # SLAM mode:
+      #  "localization" loads the saved map (mnt/droidal_map.*) read-only and
+      #    relocalizes against it (set the pose with Foxglove's "Publish -> Pose
+      #    estimate" -> /initialpose). Nav2 navigates on the fixed map.
+      #  "mapping" builds/extends the map live. Nav2 still works AND the map keeps
+      #    growing as you drive -- this is the mode for auto-exploration (enable
+      #    the explorer with `ros2 topic pub /explore/enable std_msgs/Bool
+      #    "{data: true}"`). Save the result with slam_toolbox/serialize_map.
       SLAM_MODE: "localization"
       # Default: listen for the ESP32 raw-lidar TCP forwarder on :8080.
       LIDAR_TCP_PORT: "8080"
