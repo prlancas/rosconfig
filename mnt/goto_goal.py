@@ -48,13 +48,19 @@ class GotoGoal(Node):
         self.declare_parameter("goal_topic", "/goal_pose")
         self.declare_parameter("cmd_topic", "/cmd_vel")
         self.declare_parameter("rate_hz", 15.0)
-        self.declare_parameter("goal_tolerance", 0.15)      # metres
+        self.declare_parameter("goal_tolerance", 0.20)      # metres
         self.declare_parameter("heading_threshold", 0.5)    # rad: rotate in place above this
         self.declare_parameter("heading_deadband", 0.12)    # rad: no steering correction below this (anti-oscillation)
         self.declare_parameter("max_linear", 0.4)           # ODrive turns/s (not m/s)
+        self.declare_parameter("min_linear", 0.22)          # floor so the heavy base doesn't stall short of the goal
         self.declare_parameter("max_angular", 0.5)
         self.declare_parameter("linear_gain", 0.6)
         self.declare_parameter("angular_gain", 0.9)
+        # Measured on the robot: a POSITIVE cmd_vel angular.z makes the odom/map yaw
+        # DECREASE (the drive vs odometry rotation convention is opposite). So the
+        # steering command must be inverted, otherwise the heading loop is positive
+        # feedback and oscillates. Kept as a param in case the firmware is fixed later.
+        self.declare_parameter("angular_sign", -1.0)
         self.declare_parameter("max_goal_distance", 30.0)   # ignore clearly bogus clicks
 
         g = self.get_parameter
@@ -64,9 +70,10 @@ class GotoGoal(Node):
         self.head_thr = g("heading_threshold").value
         self.head_db = g("heading_deadband").value
         self.max_lin = g("max_linear").value
+        self.min_lin = g("min_linear").value
         self.max_ang = g("max_angular").value
         self.k_lin = g("linear_gain").value
-        self.k_ang = g("angular_gain").value
+        self.k_ang = g("angular_gain").value * g("angular_sign").value
         self.max_goal_dist = g("max_goal_distance").value
 
         self.goal = None  # (x, y) in map frame
@@ -172,6 +179,10 @@ class GotoGoal(Node):
             cmd.angular.z = _clamp(self.k_ang * yaw_err, -self.max_ang, self.max_ang)
         else:
             cmd.linear.x = _clamp(self.k_lin * dist, -self.max_lin, self.max_lin)
+            # Floor the speed: the heavy base stalls below ~min_lin, which would
+            # leave it creeping to a halt short of the goal.
+            if 0.0 < cmd.linear.x < self.min_lin:
+                cmd.linear.x = self.min_lin
             # Deadband the steering correction so small heading errors don't make
             # the heavy base hunt/oscillate while driving forward.
             if abs(yaw_err) > self.head_db:
