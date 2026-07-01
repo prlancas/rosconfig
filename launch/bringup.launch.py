@@ -3,10 +3,14 @@
 Starts everything that used to be launched by hand inside the desktop-full
 container:
 
-  * droidal_viz.py        -> URDF, odom->base_link + wheel/laser TFs from /odrive_status
+  * droidal_viz.py        -> URDF, /odom + odom->base_link + wheel/laser TFs
   * lidar_scan_node.py    -> raw Delta-2 bytes -> /scan
-  * slam_toolbox          -> online async mapping (map->odom)
-  * goto_goal.py          -> /goal_pose (e.g. clicked in Foxglove) -> /cmd_vel
+  * slam_toolbox          -> online async mapping / localization (map->odom)
+  * Nav2                  -> planner + RPP controller + costmaps + smoother + BT,
+                             consumes /goal_pose goals, outputs /cmd_vel
+  * goal_bridge.py        -> /goal_pose (clicked in Foxglove/Android) -> Nav2
+                             NavigateToPose action
+  * waypoint_manager.py   -> labeled targets (save/goto by name) persisted to disk
   * foxglove_bridge       -> websocket on :8765 so a browser/Foxglove app can
                              view /map, /scan, TF + robot model and teleop /cmd_vel
 
@@ -68,10 +72,20 @@ def generate_launch_description():
         respawn_delay=2.0,
     )
 
-    # Click-to-navigate: turns a /goal_pose (from Foxglove's Publish->Pose tool)
-    # into /cmd_vel. Simple controller, no obstacle avoidance (Nav2 comes later).
-    goto_goal = ExecuteProcess(
-        cmd=["python3", os.path.join(PKG_DIR, "goto_goal.py")],
+    # Bridge: a clicked /goal_pose (Foxglove's Publish->Pose tool, or later the
+    # Android app) becomes a Nav2 NavigateToPose action goal. Replaces the old
+    # lightweight goto_goal controller (which is now retired).
+    goal_bridge = ExecuteProcess(
+        cmd=["python3", os.path.join(PKG_DIR, "goal_bridge.py")],
+        output="screen",
+        respawn=True,
+        respawn_delay=2.0,
+    )
+
+    # Labeled waypoint store: "save this spot as 'cooker'", "go to 'cooker'".
+    # Groundwork for the Android app + VLM-tagged locations.
+    waypoint_manager = ExecuteProcess(
+        cmd=["python3", os.path.join(PKG_DIR, "waypoint_manager.py")],
         output="screen",
         respawn=True,
         respawn_delay=2.0,
@@ -137,12 +151,108 @@ def generate_launch_description():
         respawn_delay=2.0,
     )
 
+    # --- Nav2 navigation stack -------------------------------------------------
+    # slam_toolbox (localization) already provides map + map->odom, so there is no
+    # amcl/map_server here. These are lifecycle nodes brought up by Nav2's own
+    # lifecycle_manager (autostart), separate from the slam lifecycle above.
+    nav2_params = os.path.join(PKG_DIR, "nav2_params.yaml")
+    nav2_node_names = [
+        "controller_server",
+        "planner_server",
+        "behavior_server",
+        "bt_navigator",
+        "waypoint_follower",
+        "velocity_smoother",
+    ]
+
+    controller_server = Node(
+        package="nav2_controller",
+        executable="controller_server",
+        name="controller_server",
+        output="screen",
+        parameters=[nav2_params],
+        # controller output -> smoother input (/cmd_vel_nav); smoother -> /cmd_vel.
+        remappings=[("cmd_vel", "cmd_vel_nav")],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+    planner_server = Node(
+        package="nav2_planner",
+        executable="planner_server",
+        name="planner_server",
+        output="screen",
+        parameters=[nav2_params],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+    behavior_server = Node(
+        package="nav2_behaviors",
+        executable="behavior_server",
+        name="behavior_server",
+        output="screen",
+        parameters=[nav2_params],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+    bt_navigator = Node(
+        package="nav2_bt_navigator",
+        executable="bt_navigator",
+        name="bt_navigator",
+        output="screen",
+        parameters=[nav2_params],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+    waypoint_follower = Node(
+        package="nav2_waypoint_follower",
+        executable="waypoint_follower",
+        name="waypoint_follower",
+        output="screen",
+        parameters=[nav2_params],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+    velocity_smoother = Node(
+        package="nav2_velocity_smoother",
+        executable="velocity_smoother",
+        name="velocity_smoother",
+        output="screen",
+        parameters=[nav2_params],
+        # Takes the controller's cmd_vel_nav, publishes the final smoothed /cmd_vel
+        # that the ESP subscribes to.
+        remappings=[("cmd_vel", "cmd_vel_nav"), ("cmd_vel_smoothed", "cmd_vel")],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+    nav2_lifecycle_manager = Node(
+        package="nav2_lifecycle_manager",
+        executable="lifecycle_manager",
+        name="lifecycle_manager_navigation",
+        output="screen",
+        parameters=[{
+            "autostart": True,
+            "node_names": nav2_node_names,
+        }],
+        respawn=True,
+        respawn_delay=2.0,
+    )
+
     return LaunchDescription([
         droidal_viz,
         lidar_node,
-        goto_goal,
         foxglove,
         slam,
         slam_configure,
         slam_activate,
+        # Nav2 stack
+        controller_server,
+        planner_server,
+        behavior_server,
+        bt_navigator,
+        waypoint_follower,
+        velocity_smoother,
+        nav2_lifecycle_manager,
+        # Goal delivery + labeled targets
+        goal_bridge,
+        waypoint_manager,
     ])

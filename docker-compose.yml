@@ -36,10 +36,10 @@ services:
       # For a USB-UART adapter instead, comment the line above and set:
       # LIDAR_SERIAL: "/dev/ttyUSB0"
       # LIDAR_BAUD: "115200"
-      # Orientation tuning passed straight to lidar_scan_node.py.
-      # --flip fixes the mirrored rotation; --angle-offset rotates the scan
-      # (CCW degrees) so the robot's heading matches the map.
-      LIDAR_EXTRA_ARGS: "--flip --angle-offset 90"
+      # Lidar orientation is now baked into the laser_frame TF in droidal_viz.py
+      # (the raw scan is published as-is), so no --flip/--angle-offset here. Add
+      # LIDAR_EXTRA_ARGS only if you need to fine-tune the scan angle offset.
+      # LIDAR_EXTRA_ARGS: "--angle-offset 0"
     depends_on:
       - micro-ros-agent
     restart: unless-stopped

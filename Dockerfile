@@ -11,7 +11,10 @@ SHELL ["/bin/bash", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-jazzy-slam-toolbox \
         ros-jazzy-tf2-ros \
+        ros-jazzy-tf-transformations \
         ros-jazzy-foxglove-bridge \
+        ros-jazzy-navigation2 \
+        ros-jazzy-nav2-bringup \
         python3-serial \
     && rm -rf /var/lib/apt/lists/*
 

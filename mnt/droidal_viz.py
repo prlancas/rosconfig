@@ -3,6 +3,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import Odometry
 import tf2_ros
 import math
 
@@ -88,7 +89,9 @@ URDF_CONTENT = """<?xml version="1.0"?>
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="laser_frame"/>
-    <origin xyz="-0.125 0 0.22" rpy="0 0 0"/>
+    <!-- rpy roll=pi, yaw=pi/2: lidar mounted flipped + rotated 90deg. Must match
+         the laser TF broadcast in code (quaternion 0.707,0.707,0,0). -->
+    <origin xyz="-0.125 0 0.22" rpy="3.14159265 0 1.5708"/>
   </joint>
 </robot>
 """
@@ -115,6 +118,9 @@ class DroidalBridge(Node):
         
         self.subscription = self.create_subscription(String, 'odrive_status', self.listener_callback, 10)
         self.joint_pub = self.create_publisher(JointState, 'joint_states', 10)
+        # nav_msgs/Odometry on /odom: Nav2's controller_server needs this for
+        # velocity feedback (TF alone isn't enough).
+        self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # Odometry State
@@ -123,6 +129,7 @@ class DroidalBridge(Node):
         self.th = 0.0
         self.last_p_right = None
         self.last_p_left = None
+        self.last_time = None
         
         # Physical Constants
         self.wheel_radius = 0.095 # 19cm diameter
@@ -136,12 +143,22 @@ class DroidalBridge(Node):
             p_right = float(parts[0].split(':')[1]) # Motor 0
             p_left = float(parts[1].split(':')[1])  # Motor 1
             
-            now = self.get_clock().now().to_msg()
+            now_time = self.get_clock().now()
+            now = now_time.to_msg()
+
+            # Per-step deltas (also used to derive velocities for /odom).
+            d_center = 0.0
+            d_theta = 0.0
+            dt = 0.0
 
             # 1. Update Odometry (x, y, theta)
+            # REP-103 contract (matches the firmware's cmd_vel mixing): driving
+            # forward increases x, turning counter-clockwise (left) increases theta.
+            # A0 = motor 0 = RIGHT wheel (encoder is sign-inverted, hence the minus),
+            # A1 = motor 1 = LEFT wheel. Do NOT change these signs without also
+            # re-checking the firmware mixing, or the heading loop inverts again.
             if self.last_p_right is not None:
                 # Delta in rotations (turns)
-                # We invert dp_right because the physical orientation/feedback is reversed
                 dp_right = -(p_right - self.last_p_right)
                 dp_left = (p_left - self.last_p_left)
 
@@ -158,8 +175,15 @@ class DroidalBridge(Node):
                 self.y += d_center * math.sin(self.th)
                 self.th += d_theta
 
+                if self.last_time is not None:
+                    dt = (now_time - self.last_time).nanoseconds / 1e9
+
+            self.last_time = now_time
             self.last_p_right = p_right
             self.last_p_left = p_left
+
+            vx = d_center / dt if dt > 0 else 0.0
+            vth = d_theta / dt if dt > 0 else 0.0
 
             # 2. Broadcast Odom -> Base Link
             t_odom = TransformStamped()
@@ -175,6 +199,21 @@ class DroidalBridge(Node):
             t_odom.transform.rotation.y = q_body[1]
             t_odom.transform.rotation.z = q_body[2]
             t_odom.transform.rotation.w = q_body[3]
+
+            # 2b. Publish nav_msgs/Odometry on /odom (pose + body-frame velocity)
+            odom_msg = Odometry()
+            odom_msg.header.stamp = now
+            odom_msg.header.frame_id = 'odom'
+            odom_msg.child_frame_id = 'base_link'
+            odom_msg.pose.pose.position.x = self.x
+            odom_msg.pose.pose.position.y = self.y
+            odom_msg.pose.pose.orientation.x = q_body[0]
+            odom_msg.pose.pose.orientation.y = q_body[1]
+            odom_msg.pose.pose.orientation.z = q_body[2]
+            odom_msg.pose.pose.orientation.w = q_body[3]
+            odom_msg.twist.twist.linear.x = vx
+            odom_msg.twist.twist.angular.z = vth
+            self.odom_pub.publish(odom_msg)
 
             # 3. Broadcast Static and Wheel TFs
             transforms = [t_odom]
@@ -219,8 +258,17 @@ class DroidalBridge(Node):
             # Using the measurements we calculated: 22cm back from front, 22cm from floor
             t_laser.transform.translation.x = -0.125
             t_laser.transform.translation.y = 0.0
-            t_laser.transform.translation.z = 0.22 
-            t_laser.transform.rotation.w = 1.0  # No rotation relative to base_link
+            t_laser.transform.translation.z = 0.22
+            # Lidar mounting orientation, baked in here instead of mutating the raw
+            # scan (the old --flip --angle-offset 90 hack). This quaternion is
+            # RPY (roll=pi, yaw=pi/2): the Delta-2 is effectively mounted flipped
+            # (roll pi reverses the scan handedness, same as --flip) and rotated
+            # 90 deg (yaw). It reproduces the previous known-good scan geometry as a
+            # rigid transform. Fine-tune by facing a wall so /scan shows it at +x.
+            t_laser.transform.rotation.x = 0.70710678
+            t_laser.transform.rotation.y = 0.70710678
+            t_laser.transform.rotation.z = 0.0
+            t_laser.transform.rotation.w = 0.0
             transforms.append(t_laser)
             #self.tf_broadcaster.sendTransform(transforms)
             # New way: Give the transform a tiny bit of 'future' validity 
