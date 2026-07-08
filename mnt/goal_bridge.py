@@ -40,7 +40,11 @@ class GoalBridge(Node):
         super().__init__("goal_bridge")
 
         self.declare_parameter("map_frame", "map")
-        self.declare_parameter("goal_topic", "/goal_pose")
+        # Foxglove's "2D Goal Pose" tool publishes to /move_base_simple/goal by
+        # default, so we listen there. (Nav2's bt_navigator already subscribes to
+        # /goal_pose directly, so we deliberately do NOT also listen on /goal_pose
+        # -- that would fire two NavigateToPose goals per click.)
+        self.declare_parameter("goal_topic", "/move_base_simple/goal")
         self.declare_parameter("action_name", "navigate_to_pose")
 
         self.map_frame = self.get_parameter("map_frame").value
