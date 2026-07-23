@@ -13,6 +13,8 @@ container:
   * waypoint_manager.py   -> labeled targets (save/goto by name) persisted to disk
   * explorer.py           -> opt-in frontier exploration (/explore/enable) that
                              drives Nav2 to auto-map (SLAM_MODE=mapping)
+  * android_bridge.py     -> UDP JSON from the Android app -> /explore/enable,
+                             /goal_pose/cancel, /cmd_vel (explore + freeze)
   * foxglove_bridge       -> websocket on :8765 so a browser/Foxglove app can
                              view /map, /scan, TF + robot model and teleop /cmd_vel
 
@@ -98,6 +100,17 @@ def generate_launch_description():
     # Only useful with SLAM_MODE=mapping.
     explorer = ExecuteProcess(
         cmd=["python3", os.path.join(PKG_DIR, "explorer.py")],
+        output="screen",
+        respawn=True,
+        respawn_delay=2.0,
+    )
+
+    # Android app command bridge: receives UDP JSON from the phone (Droidal's
+    # voice/face) and republishes to ROS topics -- explore on/off and an
+    # emergency freeze (stop exploring + cancel Nav2 goal + zero /cmd_vel).
+    # network_mode: host exposes the UDP port directly on the host.
+    android_bridge = ExecuteProcess(
+        cmd=["python3", os.path.join(PKG_DIR, "android_bridge.py")],
         output="screen",
         respawn=True,
         respawn_delay=2.0,
@@ -268,4 +281,5 @@ def generate_launch_description():
         goal_bridge,
         waypoint_manager,
         explorer,
+        android_bridge,
     ])

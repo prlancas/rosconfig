@@ -39,6 +39,13 @@ Everything runs via `docker compose` (two containers):
      frontiers (numpy) and sends them to Nav2 (`NavigateToPose`) to self-map;
      blacklists unreachable/timed-out frontiers. Starts DISABLED; toggle with
      `/explore/enable` (`std_msgs/Bool`). Only useful with `SLAM_MODE=mapping`.
+   - `mnt/android_bridge.py` — UDP JSON command bridge for the Android app
+     (which can't speak DDS). Binds `udp/0.0.0.0:8790` (`~port` param; exposed
+     directly via `network_mode: host`) and republishes to ROS topics:
+     `{"command":"explore","enable":bool}` -> `/explore/enable`;
+     `{"command":"freeze"}` -> `/explore/enable false` + `std_msgs/Empty` on
+     `/goal_pose/cancel` + a zero `geometry_msgs/Twist` on `/cmd_vel`. The app
+     end is `RobotBridge.kt` (default: subnet broadcast, so no host IP needed).
    - `foxglove_bridge` — websocket on `:8765` for headless visualization/teleop
      (connect the Foxglove app to `ws://<host>:8765`). Port overridable via
      `FOXGLOVE_PORT`. This is the debug/visualization surface; a custom product
