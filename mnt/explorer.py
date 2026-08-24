@@ -19,7 +19,9 @@ avoids obstacles from `/scan`, but a mis-tuned base can still bump a wall.
 
 No extra ROS packages needed: it reuses Nav2 (NavigateToPose) and numpy.
 """
+import json
 import math
+import os
 
 import numpy as np
 import rclpy
@@ -53,6 +55,14 @@ class Explorer(Node):
         self.declare_parameter("goal_timeout_s", 60.0)    # give up on a stuck goal
         self.declare_parameter("plan_period_s", 2.0)
         self.declare_parameter("start_enabled", False)
+        # Door-aware exploration: prefer frontiers near doors the Android app has
+        # seen (pushed to android_bridge's objects.json), so Droidal drives
+        # through openings into new rooms instead of finishing the current one.
+        self.declare_parameter(
+            "objects_file",
+            os.environ.get("OBJECTS_FILE", "/opt/droidal/objects.json"))
+        self.declare_parameter("door_bias", 3.0)          # cost bonus near a door
+        self.declare_parameter("door_radius_m", 1.5)      # "near a door" distance
 
         g = self.get_parameter
         self.map_frame = g("map_frame").value
@@ -64,6 +74,11 @@ class Explorer(Node):
         self.gain_weight = float(g("gain_weight").value)
         self.blacklist_radius = float(g("blacklist_radius_m").value)
         self.goal_timeout = float(g("goal_timeout_s").value)
+        self.objects_file = g("objects_file").value
+        self.door_bias = float(g("door_bias").value)
+        self.door_radius = float(g("door_radius_m").value)
+        self._doors = []          # cached [(x, y)] door landmarks
+        self._doors_mtime = None  # mtime of objects_file when last loaded
 
         self.enabled = bool(g("start_enabled").value)
         self.map = None
@@ -124,6 +139,7 @@ class Explorer(Node):
             self.get_logger().warning("no map->base_link TF yet", throttle_duration_sec=5.0)
             return
 
+        self._refresh_doors()
         target = self._pick_frontier(pose)
         if target is None:
             self.get_logger().info(
@@ -179,8 +195,12 @@ class Explorer(Node):
             if self._blacklisted(cx, cy):
                 continue
             dist = math.hypot(cx - rx, cy - ry)
-            # Lower is better: near frontiers, penalise, minus a size bonus.
+            # Lower is better: near frontiers, penalise, minus a size bonus, and
+            # minus a door bonus so frontiers by a doorway win (drive into the
+            # next room rather than mopping up the current one).
             cost = dist - self.gain_weight * math.log(n + 1.0)
+            if self._near_door(cx, cy):
+                cost -= self.door_bias
             if best_cost is None or cost < best_cost:
                 best_cost = cost
                 best = (cx, cy)
@@ -189,6 +209,35 @@ class Explorer(Node):
     def _blacklisted(self, x, y):
         for (bx, by) in self.blacklist:
             if math.hypot(x - bx, y - by) < self.blacklist_radius:
+                return True
+        return False
+
+    # --- door landmarks (pushed by the Android app) --------------------------
+    def _refresh_doors(self):
+        """Reload door landmarks from objects.json when the file changes."""
+        try:
+            mtime = os.path.getmtime(self.objects_file)
+        except OSError:
+            return  # no file yet; keep whatever we had
+        if mtime == self._doors_mtime:
+            return
+        self._doors_mtime = mtime
+        try:
+            with open(self.objects_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            self.get_logger().warning(f"could not read {self.objects_file}: {e}")
+            return
+        doors = []
+        for o in data if isinstance(data, list) else []:
+            if o.get("isDoor") and "worldX" in o and "worldY" in o:
+                doors.append((float(o["worldX"]), float(o["worldY"])))
+        self._doors = doors
+        self.get_logger().info(f"door-aware exploration: {len(doors)} door(s) loaded")
+
+    def _near_door(self, x, y):
+        for (dx, dy) in self._doors:
+            if math.hypot(x - dx, y - dy) < self.door_radius:
                 return True
         return False
 

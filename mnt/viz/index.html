@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Droidal — object map</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Droidal <span class="muted">object map</span></h1>
+    <div class="controls">
+      <input id="search" type="search" placeholder="Search objects (cooker, sofa, door…)" autocomplete="off" />
+      <label class="chk"><input id="doorsOnly" type="checkbox" /> doors only</label>
+      <span id="status" class="status">connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <div id="stage">
+      <canvas id="map"></canvas>
+      <div id="empty" class="empty hidden">No map yet. Start SLAM (mapping mode) and explore.</div>
+    </div>
+    <aside id="panel">
+      <h2>Objects <span id="count" class="muted"></span></h2>
+      <ul id="list"></ul>
+    </aside>
+  </main>
+
+  <div id="detail" class="detail hidden">
+    <button id="detailClose" aria-label="Close">×</button>
+    <img id="detailThumb" alt="" />
+    <div id="detailBody"></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

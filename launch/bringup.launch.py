@@ -14,7 +14,11 @@ container:
   * explorer.py           -> opt-in frontier exploration (/explore/enable) that
                              drives Nav2 to auto-map (SLAM_MODE=mapping)
   * android_bridge.py     -> UDP JSON from the Android app -> /explore/enable,
-                             /goal_pose/cancel, /cmd_vel (explore + freeze)
+                             /goal_pose/cancel, /cmd_vel (explore + freeze), PLUS a
+                             threaded HTTP server on :8791 (~http_port) for the
+                             spatial-memory link: GET /pose,/scan,/map.png,/map.json;
+                             POST /goal,/goal/cancel,/objects; and a web visualiser
+                             of the map + object pins at http://<host>:8791/
   * foxglove_bridge       -> websocket on :8765 so a browser/Foxglove app can
                              view /map, /scan, TF + robot model and teleop /cmd_vel
 
@@ -108,7 +112,9 @@ def generate_launch_description():
     # Android app command bridge: receives UDP JSON from the phone (Droidal's
     # voice/face) and republishes to ROS topics -- explore on/off and an
     # emergency freeze (stop exploring + cancel Nav2 goal + zero /cmd_vel).
-    # network_mode: host exposes the UDP port directly on the host.
+    # Also runs an HTTP server on :8791 (~http_port) for the spatial-memory link
+    # (pose/scan/map/goal/objects) and serves the web visualiser at that port.
+    # network_mode: host exposes the UDP + HTTP ports directly on the host.
     android_bridge = ExecuteProcess(
         cmd=["python3", os.path.join(PKG_DIR, "android_bridge.py")],
         output="screen",
