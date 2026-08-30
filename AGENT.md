@@ -43,23 +43,20 @@ Everything runs via `docker compose` (two containers):
      `~objects_file` (reads the same `objects.json` `android_bridge.py` writes), so
      Droidal preferentially drives through open doorways into unexplored rooms.
    - `mnt/android_bridge.py` — command + spatial-memory bridge for the Android
-     app (which can't speak DDS). Two transports:
-     - **UDP** on `udp/0.0.0.0:8790` (`~port`; exposed via `network_mode: host`):
-       `{"command":"explore","enable":bool}` -> `/explore/enable`;
-       `{"command":"freeze"}` -> `/explore/enable false` + `std_msgs/Empty` on
-       `/goal_pose/cancel` + a zero `geometry_msgs/Twist` on `/cmd_vel`. The app
-       end is `RobotBridge.kt` (default: subnet broadcast, so no host IP needed).
-     - **HTTP** on `0.0.0.0:8791` (`~http_port`) for request/response the app's
-       `RobotHttpClient.kt` uses for spatial object memory: `GET /pose` (TF
-       `map->base_link`), `GET /scan` (compact LaserScan), `GET /map.png` +
-       `GET /map.json` (rendered OccupancyGrid + origin/resolution); `POST /goal`
-       `{x,y,yaw?}` -> `PoseStamped` on `/move_base_simple/goal` (reuses
-       `goal_bridge.py`), `POST /goal/cancel`; `POST /objects` stores phone-pushed
-       object landmarks (label, canonical, world x/y, thumbnail) to
-       `~objects_file` (default `/opt/droidal/objects.json`). It also serves the
-       **web visualiser** (`mnt/viz/`) at `http://<host>:8791/` — the map with
-       object pins, text search over canonical/alias, thumbnails, and
-       door/unexplored markers.
+     app (which can't speak DDS). Unified transport:
+     - **WebSocket** on `0.0.0.0:8791` (`~ws_port`; exposed via `network_mode: host`).
+       The app connects via `RobotWsClient.kt`:
+       - Commands: `{"type":"command","command":"explore","enable":bool}`,
+         `{"type":"command","command":"freeze"}` -> `/explore/enable false` +
+         `std_msgs/Empty` on `/goal_pose/cancel` + zero `geometry_msgs/Twist` on `/cmd_vel`.
+       - Requests: `{"type":"request","id":uuid,"method":"GET","path":"/pose"}` (TF
+         `map->base_link`), `GET /scan`, `GET /map.json`, `POST /goal` `{x,y,yaw}`,
+         `POST /goal/cancel`, `POST /objects` (persists phone-pushed object landmarks
+         to `~objects_file`, default `/opt/droidal/objects.json`).
+       - It also serves the **web visualiser** (`mnt/viz/`) at `http://<host>:8791/`
+         via HTTP fallback on the same port — the map with realtime robot pose and
+         object pins (text search over canonical/alias, thumbnails, and
+         door/unexplored markers).
    - `foxglove_bridge` — websocket on `:8765` for headless visualization/teleop
      (connect the Foxglove app to `ws://<host>:8765`). Port overridable via
      `FOXGLOVE_PORT`. This is the debug/visualization surface; a custom product

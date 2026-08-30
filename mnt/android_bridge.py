@@ -2,67 +2,69 @@
 """
 Android command + telemetry bridge for Droidal.
 
-Two transports, one node:
+Single transport, one node:
 
-1. **UDP JSON** (unchanged, port ``~port`` default 8790) -- tiny, fire-and-forget
-   safety commands from the app's ``RobotBridge.kt``. A dropped datagram must
-   never leave the robot driving, so these are idempotent and re-sent by the app:
+**WebSocket** (port ``~ws_port`` default 8791) -- all Android app traffic goes
+here over a persistent TCP connection.  The ``process_request`` hook on the
+same port also serves the static web visualiser (``GET /``, ``GET /app.js``,
+``GET /style.css``) and the binary map PNG (``GET /map.png``) so browsers
+continue to work without a separate HTTP port.
 
-     {"command": "explore", "enable": true}   -> /explore/enable  std_msgs/Bool(true)
-     {"command": "explore", "enable": false}  -> /explore/enable  std_msgs/Bool(false)
-     {"command": "freeze"}                     -> stop everything (see _freeze)
-     {"command": "ping"}                       -> logged only (health check)
+Messages from the phone arrive as JSON text frames:
 
-2. **HTTP** (new, port ``~http_port`` default 8791) -- request/response for the
-   richer spatial-memory link from the app's ``RobotHttpClient.kt``. UDP is a poor
-   fit for reading state or uploading images, so those go over HTTP:
+  Commands (fire-and-forget; no reply required):
+    {"type":"command","command":"explore","enable":true|false}
+    {"type":"command","command":"freeze"}
+    {"type":"command","command":"ping"}
 
-     GET  /pose         -> {"x","y","yaw","stamp"}         (TF map->base_link)
-     GET  /scan         -> {"angle_min","angle_increment", (latest /scan)
-                            "range_min","range_max","ranges":[...]}
-     GET  /map.json     -> {"resolution","width","height","origin":{x,y,yaw}}
-     GET  /map.png      -> occupancy grid as a grayscale PNG (north-up)
-     POST /goal         {"x","y","yaw"?} -> PoseStamped on /move_base_simple/goal
-                            (goal_bridge then drives there via Nav2)
-     POST /goal/cancel  -> std_msgs/Empty on /goal_pose/cancel
-     POST /objects      {"objects":[...]} | {single object} -> merge into
-                            objects.json (+ optional base64 thumbnail per object)
-     GET  /objects      -> the stored object landmarks (for the visualiser)
-     GET  /thumb/<id>   -> the saved JPEG thumbnail for an object
-     GET  / , /app.js   -> the static web visualiser (see viz/ alongside this file)
+  Requests (the phone includes an "id" and waits for a matching response):
+    {"type":"request","id":"<uuid>","method":"GET","path":"/pose"}
+    {"type":"request","id":"<uuid>","method":"GET","path":"/scan"}
+    {"type":"request","id":"<uuid>","method":"GET","path":"/map.json"}
+    {"type":"request","id":"<uuid>","method":"POST","path":"/goal",
+     "body":{"x":1.0,"y":2.0,"yaw":0.0}}
+    {"type":"request","id":"<uuid>","method":"POST","path":"/goal/cancel"}
+    {"type":"request","id":"<uuid>","method":"POST","path":"/objects",
+     "body":{"objects":[...]}}
+    {"type":"request","id":"<uuid>","method":"GET","path":"/objects"}
 
-Because the compose stack runs with ``network_mode: host`` both ports are exposed
-directly on the host, so the phone reaches them at ``<host-ip>:<port>`` (or, for
-UDP only, via subnet broadcast which is the app's default).
+Responses from the server:
+    {"id":"<same>","result":<JSON value>}   -- success
+    {"id":"<same>","error":"<message>"}     -- failure
+
+Because the compose stack runs with ``network_mode: host`` the port is exposed
+directly on the host, so the phone reaches it at ``<host-ip>:<port>``.
 
 Params:
-  ~port           UDP port to bind (default 8790; matches DEFAULT_ROBOT_BRIDGE_PORT).
-  ~http_port      HTTP port to bind (default 8791; matches DEFAULT_ROBOT_BRIDGE_HTTP_PORT).
+  ~ws_port        WebSocket (and HTTP viz) port to bind (default 8791).
   ~cmd_vel_topic  velocity topic to zero on freeze (default /cmd_vel).
   ~freeze_repeats how many zero-Twist messages to send on freeze (default 5).
-  ~goal_topic     where to publish nav goals (default /move_base_simple/goal, the
-                  topic goal_bridge listens on).
+  ~goal_topic     where to publish nav goals (default /move_base_simple/goal,
+                  the topic goal_bridge listens on).
   ~map_frame / ~base_frame  TF frames for /pose (default map / base_link).
   ~objects_file   where pushed object landmarks are persisted (default
                   /opt/droidal/objects.json, on the bind-mounted mnt/).
 
-Deps: std_msgs + geometry_msgs + nav_msgs + sensor_msgs + tf2_ros + numpy (all
-already used elsewhere in the stack). PNG is encoded with the stdlib (zlib) so no
-Pillow is required.
+Deps: std_msgs + geometry_msgs + nav_msgs + sensor_msgs + tf2_ros + numpy
+(all already used elsewhere in the stack). websockets>=13 must be installed
+in the Python environment (``pip install websockets``). PNG is encoded with
+the stdlib (zlib) so no Pillow is required.
 """
 import argparse
 import base64
+import http
 import json
 import math
 import os
-import socket
 import struct
 import threading
 import zlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import numpy as np
 import rclpy
+import websockets
+import websockets.sync.server as ws_server
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import Bool, Empty
@@ -101,12 +103,26 @@ def _png_grayscale(width, height, pixels):
             + _chunk(b"IEND", b""))
 
 
+def _static_response(path):
+    """Return (status, headers, body) for a static viz file, or None if not found."""
+    rel = path.lstrip("/") or "index.html"
+    abs_path = os.path.normpath(os.path.join(VIZ_DIR, rel))
+    if not abs_path.startswith(VIZ_DIR) or not os.path.isfile(abs_path):
+        return None
+    ctype = ("text/html" if abs_path.endswith(".html")
+             else "application/javascript" if abs_path.endswith(".js")
+             else "text/css" if abs_path.endswith(".css")
+             else "application/octet-stream")
+    with open(abs_path, "rb") as f:
+        body = f.read()
+    return ctype, body
+
+
 class AndroidBridge(Node):
     def __init__(self):
         super().__init__("android_bridge")
 
-        self.declare_parameter("port", 8790)
-        self.declare_parameter("http_port", 8791)
+        self.declare_parameter("ws_port", 8791)
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("freeze_repeats", 5)
         self.declare_parameter("goal_topic", "/move_base_simple/goal")
@@ -116,8 +132,7 @@ class AndroidBridge(Node):
             "objects_file",
             os.environ.get("OBJECTS_FILE", "/opt/droidal/objects.json"))
 
-        self.port = int(self.get_parameter("port").value)
-        self.http_port = int(self.get_parameter("http_port").value)
+        self.ws_port = int(self.get_parameter("ws_port").value)
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self.freeze_repeats = int(self.get_parameter("freeze_repeats").value)
         self.goal_topic = self.get_parameter("goal_topic").value
@@ -132,7 +147,7 @@ class AndroidBridge(Node):
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, QoSProfile(depth=1))
         self._goal_pub = self.create_publisher(PoseStamped, self.goal_topic, QoSProfile(depth=1))
 
-        # Telemetry inputs cached for the HTTP GET handlers. /map + /scan are
+        # Telemetry inputs cached for WS request handlers. /map + /scan are
         # sensor streams; we keep only the latest. TF is queried on demand.
         self._latest_scan = None
         self._latest_map = None
@@ -151,24 +166,20 @@ class AndroidBridge(Node):
 
         self.objects = self._load_objects()
 
-        # --- UDP (unchanged) -------------------------------------------------
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self._sock.bind(("0.0.0.0", self.port))
-
-        self._stop = threading.Event()
-        self._udp_thread = threading.Thread(target=self._rx_loop, daemon=True)
-        self._udp_thread.start()
-
-        # --- HTTP ------------------------------------------------------------
-        self._http = ThreadingHTTPServer(("0.0.0.0", self.http_port), _make_handler(self))
-        self._http_thread = threading.Thread(target=self._http.serve_forever, daemon=True)
-        self._http_thread.start()
+        # --- WebSocket server ------------------------------------------------
+        self._ws_server = ws_server.serve(
+            self._ws_handler,
+            "0.0.0.0",
+            self.ws_port,
+            process_request=self._http_fallback,
+        )
+        self._ws_thread = threading.Thread(
+            target=self._ws_server.serve_forever, daemon=True)
+        self._ws_thread.start()
 
         self.get_logger().info(
-            f"android_bridge: UDP 0.0.0.0:{self.port} (explore/freeze) + "
-            f"HTTP 0.0.0.0:{self.http_port} (pose/scan/map/goal/objects), "
+            f"android_bridge: WS 0.0.0.0:{self.ws_port} "
+            f"(commands + RPC + viz), "
             f"{len(self.objects)} objects loaded from {self.objects_path}")
 
     # --- ROS telemetry callbacks --------------------------------------------
@@ -180,34 +191,107 @@ class AndroidBridge(Node):
         with self._lock:
             self._latest_scan = msg
 
-    # --- UDP receive loop ----------------------------------------------------
-    def _rx_loop(self):
-        while not self._stop.is_set():
-            try:
-                data, addr = self._sock.recvfrom(4096)
-            except OSError:
-                break  # socket closed on shutdown
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                self.get_logger().warning(
-                    f"ignoring malformed datagram from {addr}: {data[:64]!r}")
-                continue
-            self._handle(msg, addr)
+    # --- HTTP fallback for plain GET requests (viz + map.png) ---------------
+    def _http_fallback(self, connection, request):
+        """
+        Called by the websockets sync server for every incoming HTTP request
+        before the WS handshake. Return an HTTP response for non-upgrade
+        requests (browser viz); return None to let the WS handshake proceed.
+        """
+        # WebSocket upgrade: let the library handle it normally.
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return None
 
-    def _handle(self, msg, addr):
+        path = request.path.split("?", 1)[0]
+
+        if path == "/map.png":
+            png = self.map_png()
+            if png is None:
+                body = b'{"error":"no map"}'
+                return connection.respond(
+                    http.HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"Content-Type": "application/json",
+                     "Content-Length": str(len(body)),
+                     "Access-Control-Allow-Origin": "*"},
+                    body,
+                )
+            return connection.respond(
+                http.HTTPStatus.OK,
+                {"Content-Type": "image/png",
+                 "Content-Length": str(len(png)),
+                 "Access-Control-Allow-Origin": "*"},
+                png,
+            )
+
+        # Static viz files (index.html, app.js, style.css, …)
+        static = _static_response(path)
+        if static is not None:
+            ctype, body = static
+            return connection.respond(
+                http.HTTPStatus.OK,
+                {"Content-Type": ctype,
+                 "Content-Length": str(len(body)),
+                 "Cache-Control": "no-cache"},
+                body,
+            )
+
+        body = b'{"error":"not found"}'
+        return connection.respond(
+            http.HTTPStatus.NOT_FOUND,
+            {"Content-Type": "application/json",
+             "Content-Length": str(len(body))},
+            body,
+        )
+
+    # --- WebSocket connection handler ----------------------------------------
+    def _ws_handler(self, websocket):
+        """Handle one WebSocket connection (runs in a dedicated thread per client)."""
+        peer = websocket.remote_address
+        self.get_logger().info(f"WS connect from {peer}")
+        try:
+            for raw in websocket:
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    self.get_logger().warning(
+                        f"[{peer}] malformed WS frame: {raw[:64]!r}")
+                    continue
+                self._dispatch(websocket, msg, peer)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().info(f"WS {peer} closed: {exc}")
+
+    def _dispatch(self, ws, msg, peer):
+        """Route an incoming JSON message to the appropriate handler."""
+        mtype = str(msg.get("type", "")).lower()
+
+        if mtype == "command":
+            self._handle_command(msg, peer)
+
+        elif mtype == "request":
+            mid = msg.get("id", "")
+            try:
+                result = self._handle_request(msg, peer)
+                ws.send(json.dumps({"id": mid, "result": result}))
+            except (KeyError, TypeError, ValueError) as exc:
+                ws.send(json.dumps({"id": mid, "error": str(exc)}))
+
+        else:
+            self.get_logger().warning(f"[{peer}] unknown message type: {mtype!r}")
+
+    # --- Command handler (fire-and-forget) -----------------------------------
+    def _handle_command(self, msg, peer):
         command = str(msg.get("command", "")).lower()
         if command == "explore":
             enable = bool(msg.get("enable", False))
             self._explore_pub.publish(Bool(data=enable))
-            self.get_logger().info(f"[{addr[0]}] explore -> {enable}")
+            self.get_logger().info(f"[{peer[0]}] explore -> {enable}")
         elif command in ("freeze", "stop"):
             self._freeze()
-            self.get_logger().info(f"[{addr[0]}] freeze")
+            self.get_logger().info(f"[{peer[0]}] freeze")
         elif command == "ping":
-            self.get_logger().info(f"[{addr[0]}] ping")
+            self.get_logger().info(f"[{peer[0]}] ping")
         else:
-            self.get_logger().warning(f"[{addr[0]}] unknown command: {msg!r}")
+            self.get_logger().warning(f"[{peer[0]}] unknown command: {msg!r}")
 
     def _freeze(self):
         # 1. Stop exploring so it doesn't immediately send a new goal.
@@ -219,7 +303,71 @@ class AndroidBridge(Node):
         for _ in range(max(1, self.freeze_repeats)):
             self._cmd_vel_pub.publish(Twist())
 
-    # --- HTTP-facing helpers (called from the HTTP server thread) ------------
+    # --- Request handler (returns a JSON-serialisable value or raises) -------
+    def _handle_request(self, msg, peer):
+        method = str(msg.get("method", "GET")).upper()
+        path = str(msg.get("path", ""))
+        body = msg.get("body", {})
+
+        if method == "GET":
+            if path == "/pose":
+                pose = self.current_pose()
+                if pose is None:
+                    raise ValueError("no pose available yet")
+                return pose
+
+            elif path == "/scan":
+                scan = self.scan_snapshot()
+                if scan is None:
+                    raise ValueError("no scan available yet")
+                return scan
+
+            elif path == "/map.json":
+                meta = self.map_metadata()
+                if meta is None:
+                    raise ValueError("no map available yet")
+                return meta
+
+            elif path == "/objects":
+                return json.loads(self.objects_json())
+
+            elif path.startswith("/thumb/"):
+                oid = path[len("/thumb/"):]
+                data = self.thumb_bytes(oid)
+                if data is None:
+                    raise ValueError(f"no thumbnail for {oid}")
+                # Return base64 so it fits in a JSON text frame.
+                return {"thumb_b64": base64.b64encode(data).decode("ascii")}
+
+            else:
+                raise ValueError(f"unknown GET path: {path}")
+
+        elif method == "POST":
+            if path == "/goal":
+                x = float(body["x"])
+                y = float(body["y"])
+                yaw = float(body.get("yaw", 0.0))
+                self.publish_goal(x, y, yaw)
+                return {"result": "ok", "x": x, "y": y, "yaw": yaw}
+
+            elif path == "/goal/cancel":
+                self.cancel_goal()
+                return {"result": "ok"}
+
+            elif path == "/objects":
+                records = body.get("objects") if isinstance(body, dict) else None
+                if records is None:
+                    records = [body] if isinstance(body, dict) else []
+                stored = self.store_objects(records)
+                return {"result": "ok", "stored": stored}
+
+            else:
+                raise ValueError(f"unknown POST path: {path}")
+
+        else:
+            raise ValueError(f"unsupported method: {method}")
+
+    # --- Telemetry helpers (called from WS handler thread) -------------------
     def current_pose(self):
         """TF map->base_link as {x, y, yaw, stamp}, or None if not available yet."""
         try:
@@ -309,7 +457,7 @@ class AndroidBridge(Node):
         self._cancel_pub.publish(Empty())
         self.get_logger().info("goal cancel")
 
-    # --- object landmark store (for the visualiser) -------------------------
+    # --- Object landmark store (for the visualiser) -------------------------
     def _load_objects(self):
         try:
             with open(self.objects_path) as f:
@@ -384,139 +532,24 @@ class AndroidBridge(Node):
             return None
 
     def destroy_node(self):
-        self._stop.set()
         try:
-            self._http.shutdown()
+            self._ws_server.shutdown()
         except Exception:  # noqa: BLE001 -- best-effort on teardown
-            pass
-        try:
-            self._sock.close()
-        except OSError:
             pass
         super().destroy_node()
 
 
-def _make_handler(node):
-    """Build a BaseHTTPRequestHandler bound to the given ROS node."""
-
-    class Handler(BaseHTTPRequestHandler):
-        # Silence the default noisy stderr logging; route to the ROS logger.
-        def log_message(self, fmt, *args):
-            node.get_logger().debug("http: " + (fmt % args))
-
-        def _send_json(self, obj, code=200):
-            body = json.dumps(obj).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _send_bytes(self, data, content_type, code=200):
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(data)
-
-        def _read_json_body(self):
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            if length <= 0:
-                return {}
-            raw = self.rfile.read(length)
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                return None
-
-        def _serve_static(self, rel):
-            path = os.path.normpath(os.path.join(VIZ_DIR, rel))
-            if not path.startswith(VIZ_DIR) or not os.path.isfile(path):
-                self._send_json({"error": "not found"}, 404)
-                return
-            ctype = ("text/html" if path.endswith(".html")
-                     else "application/javascript" if path.endswith(".js")
-                     else "text/css" if path.endswith(".css")
-                     else "application/octet-stream")
-            with open(path, "rb") as f:
-                self._send_bytes(f.read(), ctype)
-
-        def do_GET(self):  # noqa: N802 -- BaseHTTPRequestHandler API
-            route = self.path.split("?", 1)[0]
-            if route == "/pose":
-                pose = node.current_pose()
-                self._send_json(pose or {"error": "no pose"}, 200 if pose else 503)
-            elif route == "/scan":
-                scan = node.scan_snapshot()
-                self._send_json(scan or {"error": "no scan"}, 200 if scan else 503)
-            elif route == "/map.json":
-                meta = node.map_metadata()
-                self._send_json(meta or {"error": "no map"}, 200 if meta else 503)
-            elif route == "/map.png":
-                png = node.map_png()
-                if png is None:
-                    self._send_json({"error": "no map"}, 503)
-                else:
-                    self._send_bytes(png, "image/png")
-            elif route == "/objects":
-                self._send_bytes(node.objects_json().encode("utf-8"), "application/json")
-            elif route.startswith("/thumb/"):
-                oid = route[len("/thumb/"):]
-                data = node.thumb_bytes(oid)
-                if data is None:
-                    self._send_json({"error": "not found"}, 404)
-                else:
-                    self._send_bytes(data, "image/jpeg")
-            elif route in ("/", "/index.html"):
-                self._serve_static("index.html")
-            elif route in ("/app.js", "/style.css"):
-                self._serve_static(route.lstrip("/"))
-            else:
-                self._send_json({"error": "not found"}, 404)
-
-        def do_POST(self):  # noqa: N802 -- BaseHTTPRequestHandler API
-            route = self.path.split("?", 1)[0]
-            body = self._read_json_body()
-            if body is None:
-                self._send_json({"error": "bad json"}, 400)
-                return
-            if route == "/goal":
-                try:
-                    x = float(body["x"])
-                    y = float(body["y"])
-                    yaw = float(body.get("yaw", 0.0))
-                except (KeyError, TypeError, ValueError):
-                    self._send_json({"error": "need numeric x,y[,yaw]"}, 400)
-                    return
-                node.publish_goal(x, y, yaw)
-                self._send_json({"result": "ok", "x": x, "y": y, "yaw": yaw})
-            elif route == "/goal/cancel":
-                node.cancel_goal()
-                self._send_json({"result": "ok"})
-            elif route == "/objects":
-                records = body.get("objects") if isinstance(body, dict) else None
-                if records is None:
-                    records = [body] if isinstance(body, dict) else []
-                stored = node.store_objects(records)
-                self._send_json({"result": "ok", "stored": stored})
-            else:
-                self._send_json({"error": "not found"}, 404)
-
-    return Handler
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=None,
-                        help="UDP port to bind (overrides the ~port param).")
+    parser.add_argument("--ws-port", type=int, default=None,
+                        help="WS port to bind (overrides the ~ws_port param).")
     args, _ = parser.parse_known_args()
 
     rclpy.init()
     node = AndroidBridge()
-    if args.port is not None and args.port != node.port:
-        node.get_logger().info(f"(CLI --port {args.port} ignored; set the ~port param instead)")
+    if args.ws_port is not None and args.ws_port != node.ws_port:
+        node.get_logger().info(
+            f"(CLI --ws-port {args.ws_port} ignored; set the ~ws_port param instead)")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

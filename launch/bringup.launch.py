@@ -13,12 +13,11 @@ container:
   * waypoint_manager.py   -> labeled targets (save/goto by name) persisted to disk
   * explorer.py           -> opt-in frontier exploration (/explore/enable) that
                              drives Nav2 to auto-map (SLAM_MODE=mapping)
-  * android_bridge.py     -> UDP JSON from the Android app -> /explore/enable,
-                             /goal_pose/cancel, /cmd_vel (explore + freeze), PLUS a
-                             threaded HTTP server on :8791 (~http_port) for the
-                             spatial-memory link: GET /pose,/scan,/map.png,/map.json;
-                             POST /goal,/goal/cancel,/objects; and a web visualiser
-                             of the map + object pins at http://<host>:8791/
+  * android_bridge.py     -> WebSocket on :8791 (~ws_port) for Android commands
+                             (/explore/enable, /goal_pose/cancel, /cmd_vel freeze)
+                             and spatial-memory RPC (pose/scan/map/goal/objects),
+                             plus fallback HTTP for the map visualiser at
+                             http://<host>:8791/
   * foxglove_bridge       -> websocket on :8765 so a browser/Foxglove app can
                              view /map, /scan, TF + robot model and teleop /cmd_vel
 
@@ -109,12 +108,10 @@ def generate_launch_description():
         respawn_delay=2.0,
     )
 
-    # Android app command bridge: receives UDP JSON from the phone (Droidal's
-    # voice/face) and republishes to ROS topics -- explore on/off and an
-    # emergency freeze (stop exploring + cancel Nav2 goal + zero /cmd_vel).
-    # Also runs an HTTP server on :8791 (~http_port) for the spatial-memory link
-    # (pose/scan/map/goal/objects) and serves the web visualiser at that port.
-    # network_mode: host exposes the UDP + HTTP ports directly on the host.
+    # Android app command bridge: receives WebSocket frames from the phone (Droidal's
+    # voice/face) for exploration and emergency freeze, as well as spatial-memory
+    # RPC (pose/scan/map/goal/objects). Also serves the web visualiser on :8791.
+    # network_mode: host exposes the WebSocket / HTTP port directly on the host.
     android_bridge = ExecuteProcess(
         cmd=["python3", os.path.join(PKG_DIR, "android_bridge.py")],
         output="screen",
