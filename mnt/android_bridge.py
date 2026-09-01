@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Android command + telemetry bridge for Droidal.
+Android command + telemetry + exploration bridge for Droidal.
 
 Single transport, one node:
 
 **WebSocket** (port ``~ws_port`` default 8791) -- all Android app traffic goes
-here over a persistent TCP connection.  The ``process_request`` hook on the
+here over a persistent TCP connection. The ``process_request`` hook on the
 same port also serves the static web visualiser (``GET /``, ``GET /app.js``,
 ``GET /style.css``) and the binary map PNG (``GET /map.png``) so browsers
 continue to work without a separate HTTP port.
@@ -21,6 +21,8 @@ Messages from the phone arrive as JSON text frames:
     {"type":"request","id":"<uuid>","method":"GET","path":"/pose"}
     {"type":"request","id":"<uuid>","method":"GET","path":"/scan"}
     {"type":"request","id":"<uuid>","method":"GET","path":"/map.json"}
+    {"type":"request","id":"<uuid>","method":"GET","path":"/nav_status"}
+    {"type":"request","id":"<uuid>","method":"GET","path":"/explore/targets"}
     {"type":"request","id":"<uuid>","method":"POST","path":"/goal",
      "body":{"x":1.0,"y":2.0,"yaw":0.0}}
     {"type":"request","id":"<uuid>","method":"POST","path":"/goal/cancel"}
@@ -32,23 +34,12 @@ Responses from the server:
     {"id":"<same>","result":<JSON value>}   -- success
     {"id":"<same>","error":"<message>"}     -- failure
 
+Server push events:
+    {"type":"event","event":"nav_status","status":"SUCCEEDED"|"ABORTED"|"CANCELED"|"NAVIGATING",
+     "target":{"x":...,"y":...,"yaw":...}}
+
 Because the compose stack runs with ``network_mode: host`` the port is exposed
 directly on the host, so the phone reaches it at ``<host-ip>:<port>``.
-
-Params:
-  ~ws_port        WebSocket (and HTTP viz) port to bind (default 8791).
-  ~cmd_vel_topic  velocity topic to zero on freeze (default /cmd_vel).
-  ~freeze_repeats how many zero-Twist messages to send on freeze (default 5).
-  ~goal_topic     where to publish nav goals (default /move_base_simple/goal,
-                  the topic goal_bridge listens on).
-  ~map_frame / ~base_frame  TF frames for /pose (default map / base_link).
-  ~objects_file   where pushed object landmarks are persisted (default
-                  /opt/droidal/objects.json, on the bind-mounted mnt/).
-
-Deps: std_msgs + geometry_msgs + nav_msgs + sensor_msgs + tf2_ros + numpy
-(all already used elsewhere in the stack). websockets>=13 must be installed
-in the Python environment (``pip install websockets``). PNG is encoded with
-the stdlib (zlib) so no Pillow is required.
 """
 import argparse
 import base64
@@ -58,23 +49,23 @@ import math
 import os
 import struct
 import threading
+import time
 import zlib
-from http.server import BaseHTTPRequestHandler
 
 import numpy as np
 import rclpy
 import websockets
 import websockets.sync.server as ws_server
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import Bool, Empty
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
+from nav2_msgs.action import NavigateToPose
 import tf2_ros
 
-# Directory holding the static web visualiser (index.html, app.js). Sits next to
-# this script so it ships in the same bind-mounted mnt/ dir.
 VIZ_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viz")
 
 
@@ -83,11 +74,7 @@ def _yaw_from_quat(x, y, z, w):
 
 
 def _png_grayscale(width, height, pixels):
-    """Encode a grayscale image (bytes-like, row-major, one byte/pixel) as PNG.
-
-    Pure stdlib (zlib) so the ROS image needs no Pillow. Color type 0 (gray),
-    8-bit depth. Each scanline is prefixed with filter byte 0 (None).
-    """
+    """Encode a grayscale image (bytes-like, row-major, one byte/pixel) as PNG."""
     def _chunk(tag, data):
         return (struct.pack(">I", len(data)) + tag + data
                 + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
@@ -126,8 +113,11 @@ class AndroidBridge(Node):
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("freeze_repeats", 5)
         self.declare_parameter("goal_topic", "/move_base_simple/goal")
+        self.declare_parameter("action_name", "navigate_to_pose")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("free_thresh", 25)
+        self.declare_parameter("occupied_thresh", 65)
         self.declare_parameter(
             "objects_file",
             os.environ.get("OBJECTS_FILE", "/opt/droidal/objects.json"))
@@ -136,22 +126,32 @@ class AndroidBridge(Node):
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self.freeze_repeats = int(self.get_parameter("freeze_repeats").value)
         self.goal_topic = self.get_parameter("goal_topic").value
+        action_name = self.get_parameter("action_name").value
         self.map_frame = self.get_parameter("map_frame").value
         self.base_frame = self.get_parameter("base_frame").value
+        self.free_thresh = int(self.get_parameter("free_thresh").value)
+        self.occ_thresh = int(self.get_parameter("occupied_thresh").value)
         self.objects_path = self.get_parameter("objects_file").value
 
-        # Latch explore/enable so a late-joining explorer still sees the last
-        # command; the plain topics use a small depth-1 queue.
         self._explore_pub = self.create_publisher(Bool, "/explore/enable", QoSProfile(depth=1))
         self._cancel_pub = self.create_publisher(Empty, "/goal_pose/cancel", QoSProfile(depth=1))
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, QoSProfile(depth=1))
         self._goal_pub = self.create_publisher(PoseStamped, self.goal_topic, QoSProfile(depth=1))
 
-        # Telemetry inputs cached for WS request handlers. /map + /scan are
-        # sensor streams; we keep only the latest. TF is queried on demand.
         self._latest_scan = None
         self._latest_map = None
         self._lock = threading.Lock()
+
+        # Nav2 action client for direct goal tracking and status reporting.
+        self._nav_client = ActionClient(self, NavigateToPose, action_name)
+        self._nav_goal_handle = None
+        self._nav_status = "IDLE"  # IDLE, NAVIGATING, SUCCEEDED, ABORTED, CANCELED
+        self._nav_target = None  # {x, y, yaw}
+        self._nav_start_time = 0.0
+
+        # Connected WebSocket clients for event broadcast.
+        self._clients = set()
+        self._clients_lock = threading.Lock()
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -166,7 +166,6 @@ class AndroidBridge(Node):
 
         self.objects = self._load_objects()
 
-        # --- WebSocket server ------------------------------------------------
         self._ws_server = ws_server.serve(
             self._ws_handler,
             "0.0.0.0",
@@ -182,7 +181,7 @@ class AndroidBridge(Node):
             f"(commands + RPC + viz), "
             f"{len(self.objects)} objects loaded from {self.objects_path}")
 
-    # --- ROS telemetry callbacks --------------------------------------------
+    # --- ROS callbacks ------------------------------------------------------
     def _on_map(self, msg):
         with self._lock:
             self._latest_map = msg
@@ -193,12 +192,6 @@ class AndroidBridge(Node):
 
     # --- HTTP fallback for plain GET requests (viz + map.png) ---------------
     def _http_fallback(self, connection, request):
-        """
-        Called by the websockets sync server for every incoming HTTP request
-        before the WS handshake. Return an HTTP response for non-upgrade
-        requests (browser viz); return None to let the WS handshake proceed.
-        """
-        # WebSocket upgrade: let the library handle it normally.
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return None
 
@@ -223,7 +216,6 @@ class AndroidBridge(Node):
                 png,
             )
 
-        # Static viz files (index.html, app.js, style.css, …)
         static = _static_response(path)
         if static is not None:
             ctype, body = static
@@ -245,9 +237,10 @@ class AndroidBridge(Node):
 
     # --- WebSocket connection handler ----------------------------------------
     def _ws_handler(self, websocket):
-        """Handle one WebSocket connection (runs in a dedicated thread per client)."""
         peer = websocket.remote_address
         self.get_logger().info(f"WS connect from {peer}")
+        with self._clients_lock:
+            self._clients.add(websocket)
         try:
             for raw in websocket:
                 try:
@@ -259,9 +252,22 @@ class AndroidBridge(Node):
                 self._dispatch(websocket, msg, peer)
         except Exception as exc:  # noqa: BLE001
             self.get_logger().info(f"WS {peer} closed: {exc}")
+        finally:
+            with self._clients_lock:
+                self._clients.discard(websocket)
+
+    def _broadcast_event(self, event_type, payload):
+        frame = json.dumps({"type": "event", "event": event_type, **payload})
+        with self._clients_lock:
+            dead = set()
+            for ws in self._clients:
+                try:
+                    ws.send(frame)
+                except Exception:
+                    dead.add(ws)
+            self._clients.difference_update(dead)
 
     def _dispatch(self, ws, msg, peer):
-        """Route an incoming JSON message to the appropriate handler."""
         mtype = str(msg.get("type", "")).lower()
 
         if mtype == "command":
@@ -278,7 +284,7 @@ class AndroidBridge(Node):
         else:
             self.get_logger().warning(f"[{peer}] unknown message type: {mtype!r}")
 
-    # --- Command handler (fire-and-forget) -----------------------------------
+    # --- Command handler ----------------------------------------------------
     def _handle_command(self, msg, peer):
         command = str(msg.get("command", "")).lower()
         if command == "explore":
@@ -294,16 +300,12 @@ class AndroidBridge(Node):
             self.get_logger().warning(f"[{peer[0]}] unknown command: {msg!r}")
 
     def _freeze(self):
-        # 1. Stop exploring so it doesn't immediately send a new goal.
         self._explore_pub.publish(Bool(data=False))
-        # 2. Cancel any active Nav2 goal (goal_bridge/bt_navigator listen here).
-        self._cancel_pub.publish(Empty())
-        # 3. Belt-and-braces: command zero velocity a few times so the base
-        #    halts even if a controller is mid-cycle.
+        self.cancel_goal()
         for _ in range(max(1, self.freeze_repeats)):
             self._cmd_vel_pub.publish(Twist())
 
-    # --- Request handler (returns a JSON-serialisable value or raises) -------
+    # --- Request handler ----------------------------------------------------
     def _handle_request(self, msg, peer):
         method = str(msg.get("method", "GET")).upper()
         path = str(msg.get("path", ""))
@@ -328,6 +330,12 @@ class AndroidBridge(Node):
                     raise ValueError("no map available yet")
                 return meta
 
+            elif path == "/nav_status":
+                return self.nav_status()
+
+            elif path == "/explore/targets":
+                return self.explore_targets()
+
             elif path == "/objects":
                 return json.loads(self.objects_json())
 
@@ -336,7 +344,6 @@ class AndroidBridge(Node):
                 data = self.thumb_bytes(oid)
                 if data is None:
                     raise ValueError(f"no thumbnail for {oid}")
-                # Return base64 so it fits in a JSON text frame.
                 return {"thumb_b64": base64.b64encode(data).decode("ascii")}
 
             else:
@@ -367,9 +374,8 @@ class AndroidBridge(Node):
         else:
             raise ValueError(f"unsupported method: {method}")
 
-    # --- Telemetry helpers (called from WS handler thread) -------------------
+    # --- Telemetry helpers ---------------------------------------------------
     def current_pose(self):
-        """TF map->base_link as {x, y, yaw, stamp}, or None if not available yet."""
         try:
             t = self.tf_buffer.lookup_transform(
                 self.map_frame, self.base_frame, rclpy.time.Time())
@@ -386,12 +392,10 @@ class AndroidBridge(Node):
         }
 
     def scan_snapshot(self):
-        """Compact latest LaserScan, or None."""
         with self._lock:
             s = self._latest_scan
         if s is None:
             return None
-        # Replace inf/nan with None so it survives JSON round-trip.
         ranges = [None if (r is None or math.isinf(r) or math.isnan(r)) else float(r)
                   for r in s.ranges]
         return {
@@ -422,12 +426,6 @@ class AndroidBridge(Node):
         }
 
     def map_png(self):
-        """Render the latest occupancy grid as a north-up grayscale PNG, or None.
-
-        Occupancy values: -1 unknown -> mid gray, 0 free -> white, 100 occupied
-        -> black. OccupancyGrid row 0 is the origin (min y); PNG row 0 is the
-        top, so rows are flipped vertically to render north-up.
-        """
         with self._lock:
             m = self._latest_map
         if m is None:
@@ -436,13 +434,29 @@ class AndroidBridge(Node):
         if w == 0 or h == 0:
             return None
         grid = np.asarray(m.data, dtype=np.int16).reshape(h, w)
-        img = np.full((h, w), 205, dtype=np.uint8)          # unknown -> light gray
-        img[(grid >= 0) & (grid <= 25)] = 254               # free -> white
-        img[grid > 65] = 0                                  # occupied -> black
-        img = np.flipud(img)                                # north-up
+        img = np.full((h, w), 205, dtype=np.uint8)
+        img[(grid >= 0) & (grid <= 25)] = 254
+        img[grid > 65] = 0
+        img = np.flipud(img)
         return _png_grayscale(w, h, img.tobytes())
 
+    # --- Navigation & Goal execution ----------------------------------------
+    def nav_status(self):
+        with self._lock:
+            elapsed = (time.time() - self._nav_start_time) if self._nav_start_time > 0 else 0.0
+            return {
+                "status": self._nav_status,
+                "target": self._nav_target,
+                "elapsed_s": round(elapsed, 1),
+            }
+
     def publish_goal(self, x, y, yaw=0.0):
+        with self._lock:
+            self._nav_status = "NAVIGATING"
+            self._nav_target = {"x": float(x), "y": float(y), "yaw": float(yaw)}
+            self._nav_start_time = time.time()
+
+        # 1. Publish to /move_base_simple/goal (for Foxglove/goal_bridge compatibility)
         goal = PoseStamped()
         goal.header.frame_id = self.map_frame
         goal.header.stamp = self.get_clock().now().to_msg()
@@ -451,13 +465,203 @@ class AndroidBridge(Node):
         goal.pose.orientation.z = math.sin(float(yaw) / 2.0)
         goal.pose.orientation.w = math.cos(float(yaw) / 2.0)
         self._goal_pub.publish(goal)
+
+        # 2. Also send directly via ActionClient if available for tracking
+        if self._nav_client.wait_for_server(timeout_sec=0.5):
+            nav_goal = NavigateToPose.Goal()
+            nav_goal.pose = goal
+            send_future = self._nav_client.send_goal_async(nav_goal)
+            send_future.add_done_callback(self._on_goal_response)
+
+        self._broadcast_event("nav_status", {"status": "NAVIGATING", "target": self._nav_target})
         self.get_logger().info(f"goal -> x={x:.2f} y={y:.2f} yaw={yaw:.2f}")
+
+    def _on_goal_response(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warning("Nav2 rejected the goal")
+            with self._lock:
+                self._nav_status = "ABORTED"
+            self._broadcast_event("nav_status", {"status": "ABORTED", "target": self._nav_target})
+            return
+        self._nav_goal_handle = handle
+        handle.get_result_async().add_done_callback(self._on_nav_result)
+
+    def _on_nav_result(self, future):
+        # status: 4 = SUCCEEDED, 5 = CANCELED, 6 = ABORTED
+        status_code = future.result().status
+        with self._lock:
+            if status_code == 4:
+                self._nav_status = "SUCCEEDED"
+                self.get_logger().info(f"goal reached: {self._nav_target}")
+            elif status_code == 5:
+                self._nav_status = "CANCELED"
+                self.get_logger().info("goal canceled")
+            else:
+                self._nav_status = "ABORTED"
+                self.get_logger().warning(f"goal aborted (code {status_code})")
+            target = self._nav_target
+            self._nav_goal_handle = None
+
+        self._broadcast_event("nav_status", {"status": self._nav_status, "target": target})
 
     def cancel_goal(self):
         self._cancel_pub.publish(Empty())
+        if self._nav_goal_handle is not None:
+            self._nav_goal_handle.cancel_goal_async()
+            self._nav_goal_handle = None
+        with self._lock:
+            self._nav_status = "CANCELED"
+            target = self._nav_target
+        self._broadcast_event("nav_status", {"status": "CANCELED", "target": target})
         self.get_logger().info("goal cancel")
 
-    # --- Object landmark store (for the visualiser) -------------------------
+    # --- Exploration targets calculation (Frontiers + Wall Sampling) ---------
+    def explore_targets(self):
+        """
+        Compute candidate exploration targets from live /map:
+        1. Frontier clusters (boundaries between known-free and unknown space).
+        2. Wall inspection vantage poses (facing wall segments).
+        3. Doorway landmarks (from objects.json) to know room boundary portals.
+        """
+        with self._lock:
+            m = self._latest_map
+        if m is None:
+            return {"frontiers": [], "wall_targets": [], "doors": [], "robot_pose": self.current_pose()}
+
+        w, h = int(m.info.width), int(m.info.height)
+        if w == 0 or h == 0:
+            return {"frontiers": [], "wall_targets": [], "doors": [], "robot_pose": self.current_pose()}
+
+        res = float(m.info.resolution)
+        ox, oy = float(m.info.origin.position.x), float(m.info.origin.position.y)
+        grid = np.asarray(m.data, dtype=np.int16).reshape(h, w)
+
+        free = (grid >= 0) & (grid <= self.free_thresh)
+        unknown = grid < 0
+        occupied = grid > self.occ_thresh
+
+        # --- A. Frontiers (Free cells with unknown 4-neighbour) ---
+        unk_neighbour = np.zeros_like(unknown)
+        unk_neighbour[1:, :] |= unknown[:-1, :]
+        unk_neighbour[:-1, :] |= unknown[1:, :]
+        unk_neighbour[:, 1:] |= unknown[:, :-1]
+        unk_neighbour[:, :-1] |= unknown[:, 1:]
+        frontier = free & unk_neighbour
+
+        rows, cols = np.nonzero(frontier)
+        frontiers = []
+        if rows.size > 0:
+            fx = ox + (cols + 0.5) * res
+            fy = oy + (rows + 0.5) * res
+            cluster_size = 0.35  # meters
+            bx = np.floor(fx / cluster_size).astype(np.int64)
+            by = np.floor(fy / cluster_size).astype(np.int64)
+            buckets = {}
+            for i in range(fx.size):
+                key = (int(bx[i]), int(by[i]))
+                acc = buckets.get(key)
+                if acc is None:
+                    buckets[key] = [fx[i], fy[i], 1]
+                else:
+                    acc[0] += fx[i]; acc[1] += fy[i]; acc[2] += 1
+
+            for (sx, sy, n) in buckets.values():
+                if n >= 4:  # ignore tiny single-cell noise
+                    cx, cy = sx / n, sy / n
+                    frontiers.append({
+                        "x": round(float(cx), 2),
+                        "y": round(float(cy), 2),
+                        "size": int(n),
+                        "is_doorway": self._is_near_door(cx, cy),
+                    })
+
+        # --- B. Wall observation vantage points ---
+        # Find occupied cells with free 4-neighbours (boundary walls).
+        free_neighbour = np.zeros_like(free)
+        free_neighbour[1:, :] |= free[:-1, :]
+        free_neighbour[:-1, :] |= free[1:, :]
+        free_neighbour[:, 1:] |= free[:, :-1]
+        free_neighbour[:, :-1] |= free[:, 1:]
+        wall_boundary = occupied & free_neighbour
+
+        w_rows, w_cols = np.nonzero(wall_boundary)
+        wall_targets = []
+        if w_rows.size > 0:
+            wx = ox + (w_cols + 0.5) * res
+            wy = oy + (w_rows + 0.5) * res
+            # Coarse sample of wall points every ~0.8m
+            w_bucket_size = 0.8
+            wbx = np.floor(wx / w_bucket_size).astype(np.int64)
+            wby = np.floor(wy / w_bucket_size).astype(np.int64)
+            w_buckets = {}
+            for i in range(wx.size):
+                key = (int(wbx[i]), int(wby[i]))
+                if key not in w_buckets:
+                    w_buckets[key] = (wx[i], wy[i])
+
+            # For each sampled wall segment, find a vantage point ~0.7m into free space
+            for (cx, cy) in w_buckets.values():
+                vantage = self._find_free_vantage(grid, w, h, ox, oy, res, cx, cy, dist_m=0.7)
+                if vantage is not None:
+                    vx, vy, yaw = vantage
+                    wall_targets.append({
+                        "x": round(float(vx), 2),
+                        "y": round(float(vy), 2),
+                        "yaw": round(float(yaw), 2),
+                        "wall_x": round(float(cx), 2),
+                        "wall_y": round(float(cy), 2),
+                    })
+
+        # --- C. Doors ---
+        doors = []
+        with self._lock:
+            for o in self.objects:
+                if o.get("isDoor") and "worldX" in o and "worldY" in o:
+                    doors.append({
+                        "id": str(o.get("id", "")),
+                        "canonical": str(o.get("canonical", "door")),
+                        "label": str(o.get("label", "Door")),
+                        "x": round(float(o["worldX"]), 2),
+                        "y": round(float(o["worldY"]), 2),
+                    })
+
+        return {
+            "robot_pose": self.current_pose(),
+            "frontiers": frontiers,
+            "wall_targets": wall_targets,
+            "doors": doors,
+        }
+
+    def _find_free_vantage(self, grid, w, h, ox, oy, res, wx, wy, dist_m=0.7):
+        """Find a free-space coordinate at dist_m from wall (wx, wy) facing towards the wall."""
+        best_v = None
+        for angle_deg in range(0, 360, 45):
+            rad = math.radians(angle_deg)
+            vx = wx + dist_m * math.cos(rad)
+            vy = wy + dist_m * math.sin(rad)
+            col = int(math.floor((vx - ox) / res))
+            row = int(math.floor((vy - oy) / res))
+            if 0 <= col < w and 0 <= row < h:
+                val = grid[row, col]
+                if 0 <= val <= self.free_thresh:
+                    # Yaw points towards the wall: from vantage (vx, vy) to wall (wx, wy)
+                    yaw = math.atan2(wy - vy, wx - vx)
+                    best_v = (vx, vy, yaw)
+                    break
+        return best_v
+
+    def _is_near_door(self, x, y, radius_m=1.2):
+        with self._lock:
+            for o in self.objects:
+                if o.get("isDoor") and "worldX" in o and "worldY" in o:
+                    dx = float(o["worldX"]) - x
+                    dy = float(o["worldY"]) - y
+                    if math.hypot(dx, dy) < radius_m:
+                        return True
+        return False
+
+    # --- Object landmark store ----------------------------------------------
     def _load_objects(self):
         try:
             with open(self.objects_path) as f:
@@ -485,13 +689,6 @@ class AndroidBridge(Node):
         return d
 
     def store_objects(self, records):
-        """Merge phone-pushed object records into the store (keyed by id).
-
-        Each record: {id, canonical, label, aliases[], worldX, worldY,
-        sourceX, sourceY, sourceYaw, confidence, isDoor, createdAt,
-        thumbBase64?}. thumbBase64 (if present) is written to a JPEG on disk and
-        replaced by a served "thumb" URL path so objects.json stays small.
-        """
         stored = 0
         with self._lock:
             by_id = {o.get("id"): i for i, o in enumerate(self.objects) if o.get("id")}
@@ -534,7 +731,7 @@ class AndroidBridge(Node):
     def destroy_node(self):
         try:
             self._ws_server.shutdown()
-        except Exception:  # noqa: BLE001 -- best-effort on teardown
+        except Exception:  # noqa: BLE001
             pass
         super().destroy_node()
 
