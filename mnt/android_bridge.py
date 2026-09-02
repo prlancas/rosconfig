@@ -56,6 +56,8 @@ import numpy as np
 import rclpy
 import websockets
 import websockets.sync.server as ws_server
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
@@ -103,6 +105,16 @@ def _static_response(path):
     with open(abs_path, "rb") as f:
         body = f.read()
     return ctype, body
+
+
+def _http_response(status, headers, body):
+    """Build an HTTP response for the non-WebSocket visualiser endpoints.
+
+    ``ServerConnection.respond()`` only accepts text, which doesn't work for
+    the PNG map and no longer accepts headers or a byte body in websockets 15.
+    """
+    status = http.HTTPStatus(status)
+    return Response(status, status.phrase, Headers(headers), body)
 
 
 class AndroidBridge(Node):
@@ -201,14 +213,14 @@ class AndroidBridge(Node):
             png = self.map_png()
             if png is None:
                 body = b'{"error":"no map"}'
-                return connection.respond(
+                return _http_response(
                     http.HTTPStatus.SERVICE_UNAVAILABLE,
                     {"Content-Type": "application/json",
                      "Content-Length": str(len(body)),
                      "Access-Control-Allow-Origin": "*"},
                     body,
                 )
-            return connection.respond(
+            return _http_response(
                 http.HTTPStatus.OK,
                 {"Content-Type": "image/png",
                  "Content-Length": str(len(png)),
@@ -219,7 +231,7 @@ class AndroidBridge(Node):
         static = _static_response(path)
         if static is not None:
             ctype, body = static
-            return connection.respond(
+            return _http_response(
                 http.HTTPStatus.OK,
                 {"Content-Type": ctype,
                  "Content-Length": str(len(body)),
@@ -228,7 +240,7 @@ class AndroidBridge(Node):
             )
 
         body = b'{"error":"not found"}'
-        return connection.respond(
+        return _http_response(
             http.HTTPStatus.NOT_FOUND,
             {"Content-Type": "application/json",
              "Content-Length": str(len(body))},
