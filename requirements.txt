@@ -1,0 +1,8 @@
+# Runtime dependencies for the Python nodes in mnt/.
+#
+# Keep NumPy on its 1.x ABI: the ROS Jazzy Python packages are built against it.
+# --no-deps is used during the image build because each package below has no
+# Python runtime dependencies and every version is pinned here.
+numpy==1.26.4
+pyserial==3.5
+websockets==15.0.1

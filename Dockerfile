@@ -15,12 +15,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-jazzy-foxglove-bridge \
         ros-jazzy-navigation2 \
         ros-jazzy-nav2-bringup \
-        python3-serial \
-        python3-numpy \
-        python3-websockets \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
+# Keep application Python packages independent of the Ubuntu package archive.
+# ROS itself remains installed from apt and is made available to this virtualenv.
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m venv --system-site-packages /opt/droidal-venv \
+    && /opt/droidal-venv/bin/pip install --no-cache-dir --no-deps -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
 ENV DROIDAL_DIR=/opt/droidal
+ENV VIRTUAL_ENV=/opt/droidal-venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 WORKDIR ${DROIDAL_DIR}
 
 # Robot scripts + SLAM params (the things you used to run by hand in /mnt).
