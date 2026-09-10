@@ -3,33 +3,113 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Droidal — object map</title>
+  <title>Droidal — Control</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+
+  <!-- ── Top bar ─────────────────────────────────────────────── -->
   <header>
-    <h1>Droidal <span class="muted">object map</span></h1>
-    <div class="controls">
-      <input id="search" type="search" placeholder="Search objects (cooker, sofa, door…)" autocomplete="off" />
-      <label class="chk"><input id="doorsOnly" type="checkbox" /> doors only</label>
-      <span id="status" class="status">connecting…</span>
+    <div class="logo">
+      <h1>Droidal <span class="muted">Control</span></h1>
+    </div>
+    <div class="header-center">
+      <div id="navBadge" class="nav-badge idle">IDLE</div>
+      <div id="navTarget" class="nav-target"></div>
+    </div>
+    <div class="header-right">
+      <div class="battery-wrap" title="Battery voltage">
+        <span id="batteryVal">--.-V</span>
+        <div class="battery-bar"><div id="batteryFill"></div></div>
+      </div>
+      <span id="connDot" class="conn-dot disconnected" title="WebSocket">●</span>
+      <button id="btnFreeze" class="btn-freeze">⛔ FREEZE</button>
     </div>
   </header>
 
-  <main>
-    <div id="stage">
-      <canvas id="map"></canvas>
-      <div id="empty" class="empty hidden">No map yet. Start SLAM (mapping mode) and explore.</div>
-    </div>
-    <aside id="panel">
-      <h2>Objects <span id="count" class="muted"></span></h2>
-      <ul id="list"></ul>
-    </aside>
-  </main>
+  <!-- ── 3-column workspace ──────────────────────────────────── -->
+  <div class="workspace">
 
+    <!-- Left sidebar -->
+    <aside class="sidebar-left">
+
+      <section>
+        <h3>Layers</h3>
+        <div id="layerToggles"></div>
+        <button id="btnFitMap" class="btn-sm w-full mt-6" title="Reset zoom to fit map">⊡ Fit Map</button>
+      </section>
+
+      <section>
+        <h3>Explorer</h3>
+        <div class="row gap-6">
+          <button id="btnExploreOn"  class="btn-sm btn-ok flex-1">▶ Enable</button>
+          <button id="btnExploreOff" class="btn-sm btn-warn flex-1">⏹ Disable</button>
+        </div>
+        <div id="exploreStatus" class="info-line muted mt-4">Disabled</div>
+        <div id="frontierCount" class="info-line muted"></div>
+      </section>
+
+      <section>
+        <h3>Navigation</h3>
+        <div id="navInfo"    class="info-line muted">Click map to set goal</div>
+        <div id="navElapsed" class="info-line muted"></div>
+        <button id="btnCancelNav" class="btn-sm btn-warn w-full mt-6" disabled>✕ Cancel Goal</button>
+      </section>
+
+      <section>
+        <h3>Save Waypoint</h3>
+        <div class="row gap-4">
+          <input id="wpName" type="text" placeholder="label…" class="input-sm" autocomplete="off" />
+          <button id="btnWpSave" class="btn-sm btn-accent">💾</button>
+        </div>
+      </section>
+
+      <section>
+        <h3>SLAM</h3>
+        <button id="btnSlamSave"  class="btn-sm w-full">💾 Save Map</button>
+        <button id="btnSlamReset" class="btn-sm btn-warn w-full mt-4">↺ Reset Map</button>
+      </section>
+
+      <section>
+        <h3>Robot Pose</h3>
+        <div id="poseX"   class="info-line muted">x: —</div>
+        <div id="poseY"   class="info-line muted">y: —</div>
+        <div id="poseYaw" class="info-line muted">yaw: —</div>
+      </section>
+
+    </aside>
+
+    <!-- Centre: map canvas -->
+    <div class="map-stage" id="stage">
+      <canvas id="map"></canvas>
+      <div id="empty" class="empty hidden">
+        No map yet.<br>Start SLAM (mapping mode) and drive around.
+      </div>
+      <div class="click-hint">Left-click → navigate &nbsp;|&nbsp; Shift+drag / middle-drag → pan &nbsp;|&nbsp; Scroll → zoom &nbsp;|&nbsp; Right-click → cancel</div>
+    </div>
+
+    <!-- Right sidebar -->
+    <aside class="sidebar-right">
+
+      <section>
+        <h3>Waypoints <span id="wpCount" class="muted"></span></h3>
+        <ul id="wpList" class="item-list"></ul>
+      </section>
+
+      <section>
+        <h3>Objects <span id="objCount" class="muted"></span></h3>
+        <input id="objSearch" type="search" placeholder="Search objects…" class="input-sm w-full mb-8" autocomplete="off" />
+        <label class="chk mb-8"><input id="doorsOnly" type="checkbox" /> Doors only</label>
+        <ul id="objList" class="item-list"></ul>
+      </section>
+
+    </aside>
+  </div>
+
+  <!-- Object detail popover -->
   <div id="detail" class="detail hidden">
     <button id="detailClose" aria-label="Close">×</button>
-    <img id="detailThumb" alt="" />
+    <img id="detailThumb" alt="" class="hidden" />
     <div id="detailBody"></div>
   </div>
 

@@ -48,6 +48,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import threading
 import time
 import zlib
@@ -61,9 +62,10 @@ from websockets.http11 import Response
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from std_msgs.msg import Bool, Empty
+from std_msgs.msg import Bool, Empty, Float32
+from std_msgs.msg import String as RosString
 from geometry_msgs.msg import Twist, PoseStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import NavigateToPose
 import tf2_ros
@@ -150,8 +152,17 @@ class AndroidBridge(Node):
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, QoSProfile(depth=1))
         self._goal_pub = self.create_publisher(PoseStamped, self.goal_topic, QoSProfile(depth=1))
 
+        # Waypoint topic publishers
+        self._wp_save_pub = self.create_publisher(RosString, "/waypoint/save", QoSProfile(depth=5))
+        self._wp_goto_pub = self.create_publisher(RosString, "/waypoint/goto", QoSProfile(depth=5))
+        self._wp_del_pub = self.create_publisher(RosString, "/waypoint/delete", QoSProfile(depth=5))
+
         self._latest_scan = None
         self._latest_map = None
+        self._latest_voltage = None
+        self._latest_path = []
+        self._latest_waypoints = {}
+        self._explore_enabled = False
         self._lock = threading.Lock()
 
         # Nav2 action client for direct goal tracking and status reporting.
@@ -175,8 +186,21 @@ class AndroidBridge(Node):
         )
         self.create_subscription(OccupancyGrid, "/map", self._on_map, map_qos)
         self.create_subscription(LaserScan, "/scan", self._on_scan, QoSProfile(depth=1))
+        self.create_subscription(Float32, "/battery_voltage", self._on_battery_voltage, QoSProfile(depth=1))
+        self.create_subscription(Path, "/plan", self._on_nav_path, QoSProfile(depth=1))
+        self.create_subscription(Bool, "/explore/enable", self._on_explore_enable, QoSProfile(depth=1))
+
+        wp_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(RosString, "/waypoint/list", self._on_waypoint_list, wp_qos)
 
         self.objects = self._load_objects()
+
+        # Telemetry broadcast timer
+        self.create_timer(2.0, self._broadcast_telemetry_tick)
 
         self._ws_server = ws_server.serve(
             self._ws_handler,
@@ -201,6 +225,41 @@ class AndroidBridge(Node):
     def _on_scan(self, msg):
         with self._lock:
             self._latest_scan = msg
+
+    def _on_battery_voltage(self, msg):
+        with self._lock:
+            self._latest_voltage = float(msg.data)
+
+    def _on_nav_path(self, msg):
+        pts = []
+        for p in msg.poses:
+            pts.append({"x": round(float(p.pose.position.x), 3), "y": round(float(p.pose.position.y), 3)})
+        with self._lock:
+            self._latest_path = pts
+
+    def _on_explore_enable(self, msg):
+        with self._lock:
+            self._explore_enabled = bool(msg.data)
+
+    def _on_waypoint_list(self, msg):
+        try:
+            data = json.loads(msg.data)
+            if isinstance(data, dict):
+                with self._lock:
+                    self._latest_waypoints = data
+        except Exception as e:
+            self.get_logger().warning(f"failed to parse /waypoint/list: {e}")
+
+    def _broadcast_telemetry_tick(self):
+        with self._lock:
+            v = self._latest_voltage
+            exp = self._explore_enabled
+            nav = self.nav_status()
+        self._broadcast_event("telemetry", {
+            "battery_v": v,
+            "explore_enabled": exp,
+            "nav_status": nav
+        })
 
     # --- HTTP fallback for plain GET requests (viz + map.png) ---------------
     def _http_fallback(self, connection, request):
@@ -345,6 +404,25 @@ class AndroidBridge(Node):
             elif path == "/nav_status":
                 return self.nav_status()
 
+            elif path == "/nav_path":
+                with self._lock:
+                    return {"points": list(self._latest_path)}
+
+            elif path == "/waypoints":
+                with self._lock:
+                    return dict(self._latest_waypoints)
+
+            elif path == "/telemetry":
+                with self._lock:
+                    v = self._latest_voltage
+                    exp = self._explore_enabled
+                    nav = self.nav_status()
+                return {
+                    "battery_v": v,
+                    "explore_enabled": exp,
+                    "nav_status": nav
+                }
+
             elif path == "/explore/targets":
                 return self.explore_targets()
 
@@ -372,6 +450,38 @@ class AndroidBridge(Node):
             elif path == "/goal/cancel":
                 self.cancel_goal()
                 return {"result": "ok"}
+
+            elif path == "/waypoint/save":
+                label = str(body.get("label", "")).strip()
+                if not label:
+                    raise ValueError("missing label")
+                self._wp_save_pub.publish(RosString(data=label))
+                self.get_logger().info(f"saved waypoint requested: {label}")
+                return {"result": "ok", "label": label}
+
+            elif path == "/waypoint/goto":
+                label = str(body.get("label", "")).strip()
+                if not label:
+                    raise ValueError("missing label")
+                self._wp_goto_pub.publish(RosString(data=label))
+                self.get_logger().info(f"goto waypoint requested: {label}")
+                return {"result": "ok", "label": label}
+
+            elif path == "/waypoint/delete":
+                label = str(body.get("label", "")).strip()
+                if not label:
+                    raise ValueError("missing label")
+                self._wp_del_pub.publish(RosString(data=label))
+                self.get_logger().info(f"delete waypoint requested: {label}")
+                return {"result": "ok", "label": label}
+
+            elif path == "/slam/save":
+                res = self.slam_save_map()
+                return {"result": "ok" if res else "error"}
+
+            elif path == "/slam/reset":
+                res = self.slam_reset_map()
+                return {"result": "ok" if res else "error"}
 
             elif path == "/objects":
                 records = body.get("objects") if isinstance(body, dict) else None
@@ -527,6 +637,51 @@ class AndroidBridge(Node):
             target = self._nav_target
         self._broadcast_event("nav_status", {"status": "CANCELED", "target": target})
         self.get_logger().info("goal cancel")
+
+    def slam_save_map(self):
+        """Call slam_toolbox serialize_map service to save the map."""
+        map_path = os.path.splitext(self.objects_path)[0] if self.objects_path else "/opt/droidal/droidal_map"
+        # default target is /opt/droidal/droidal_map
+        save_target = "/opt/droidal/droidal_map"
+        cmd = [
+            "ros2", "service", "call",
+            "/slam_toolbox/serialize_map",
+            "slam_toolbox/srv/SerializePoseGraph",
+            f"{{filename: '{save_target}'}}"
+        ]
+        self.get_logger().info(f"calling slam serialize_map -> {save_target}")
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                self.get_logger().info("slam map saved successfully")
+                return True
+            else:
+                self.get_logger().warning(f"slam map save error: {res.stderr}")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"slam map save exception: {e}")
+            return False
+
+    def slam_reset_map(self):
+        """Call slam_toolbox reset service to start mapping fresh."""
+        cmd = [
+            "ros2", "service", "call",
+            "/slam_toolbox/reset",
+            "slam_toolbox/srv/Reset",
+            "{pause_new_measurements: false}"
+        ]
+        self.get_logger().info("calling slam reset")
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                self.get_logger().info("slam reset successfully")
+                return True
+            else:
+                self.get_logger().warning(f"slam reset error: {res.stderr}")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"slam reset exception: {e}")
+            return False
 
     # --- Exploration targets calculation (Frontiers + Wall Sampling) ---------
     def explore_targets(self):
