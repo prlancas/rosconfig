@@ -180,8 +180,11 @@ class AndroidBridge(Node):
         self._nav_start_time = 0.0
 
         # Connected WebSocket clients for event broadcast.
-        self._clients = set()
-        self._clients_lock = threading.Lock()
+        # Do not call this ``_clients``: Node already uses that private name
+        # for ROS service clients. Overwriting it makes rclpy try to treat a
+        # WebSocket ServerConnection as a ROS client during executor spins.
+        self._ws_clients = set()
+        self._ws_clients_lock = threading.Lock()
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -343,8 +346,8 @@ class AndroidBridge(Node):
     def _ws_handler(self, websocket):
         peer = websocket.remote_address
         self.get_logger().info(f"WS connect from {peer}")
-        with self._clients_lock:
-            self._clients.add(websocket)
+        with self._ws_clients_lock:
+            self._ws_clients.add(websocket)
         try:
             for raw in websocket:
                 try:
@@ -357,19 +360,19 @@ class AndroidBridge(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().info(f"WS {peer} closed: {exc}")
         finally:
-            with self._clients_lock:
-                self._clients.discard(websocket)
+            with self._ws_clients_lock:
+                self._ws_clients.discard(websocket)
 
     def _broadcast_event(self, event_type, payload):
         frame = json.dumps({"type": "event", "event": event_type, **payload})
-        with self._clients_lock:
+        with self._ws_clients_lock:
             dead = set()
-            for ws in self._clients:
+            for ws in self._ws_clients:
                 try:
                     ws.send(frame)
                 except Exception:
                     dead.add(ws)
-            self._clients.difference_update(dead)
+            self._ws_clients.difference_update(dead)
 
     def _dispatch(self, ws, msg, peer):
         mtype = str(msg.get("type", "")).lower()
