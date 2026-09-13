@@ -261,8 +261,11 @@ class AndroidBridge(Node):
         with self._lock:
             v = self._latest_voltage
             exp = self._explore_enabled
-            nav = self.nav_status()
             cam_active = (time.time() - self._latest_camera_stamp < 10.0) if self._latest_camera_stamp > 0 else False
+        # nav_status() takes _lock itself. Keep this call outside the snapshot
+        # lock: threading.Lock is non-reentrant and the old nesting deadlocked
+        # the ROS executor on the first telemetry tick.
+        nav = self.nav_status()
         self._broadcast_event("telemetry", {
             "battery_v": v,
             "explore_enabled": exp,
@@ -479,8 +482,8 @@ class AndroidBridge(Node):
                 with self._lock:
                     v = self._latest_voltage
                     exp = self._explore_enabled
-                    nav = self.nav_status()
                     cam_active = (time.time() - self._latest_camera_stamp < 10.0) if self._latest_camera_stamp > 0 else False
+                nav = self.nav_status()
                 return {
                     "battery_v": v,
                     "explore_enabled": exp,
