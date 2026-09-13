@@ -74,6 +74,7 @@
     waypoints: { label: 'Waypoints', on: true  },
     objects:   { label: 'Objects',   on: true  },
     robot:     { label: 'Robot',     on: true  },
+    camera:    { label: 'Camera',    on: true  },
   };
 
   // ── WebSocket client ───────────────────────────────────────────────────────
@@ -709,6 +710,7 @@
         layer.on = cb.checked;
         if (key === 'scan'      && layer.on) refreshScan();
         if (key === 'frontiers' && layer.on) refreshFrontiers();
+        if (key === 'camera')   updateCameraVisibility();
       });
       label.append(cb, document.createTextNode(' ' + layer.label));
       container.appendChild(label);
@@ -938,6 +940,81 @@
     setInterval(refreshTelemetry, 6000);
   }
 
+  // ── Camera Feed ────────────────────────────────────────────────────────────
+  let lastCameraFrameTime = 0;
+  let cameraFpsVal = 0;
+
+  function initCamera() {
+    const closeBtn = $('cameraClose');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        LAYERS.camera.on = false;
+        const cb = $('layer-camera');
+        if (cb) cb.checked = false;
+        updateCameraVisibility();
+      });
+    }
+
+    updateCameraVisibility();
+
+    ws.on('camera_frame', msg => {
+      onCameraFrame(msg);
+    });
+
+    // Check periodically if camera frames stopped (> 6s with no frame)
+    setInterval(() => {
+      if (!LAYERS.camera.on) return;
+      const dot = document.querySelector('.camera-dot');
+      const fpsEl = $('cameraFps');
+      if (lastCameraFrameTime > 0 && Date.now() - lastCameraFrameTime > 6000) {
+        if (dot) dot.classList.add('paused');
+        if (fpsEl) fpsEl.textContent = 'Paused';
+      }
+    }, 2000);
+  }
+
+  function updateCameraVisibility() {
+    const feed = $('cameraFeed');
+    if (!feed) return;
+    if (LAYERS.camera.on) {
+      feed.classList.remove('hidden');
+    } else {
+      feed.classList.add('hidden');
+    }
+  }
+
+  function onCameraFrame(msg) {
+    if (!LAYERS.camera.on) return;
+    const now = Date.now();
+    if (lastCameraFrameTime > 0) {
+      const dt = (now - lastCameraFrameTime) / 1000;
+      if (dt > 0) {
+        cameraFpsVal = 0.8 * cameraFpsVal + 0.2 * (1 / dt);
+      }
+    } else {
+      cameraFpsVal = 0.5;
+    }
+    lastCameraFrameTime = now;
+
+    const img = $('cameraImg');
+    const placeholder = $('cameraPlaceholder');
+    const dot = document.querySelector('.camera-dot');
+    const fpsEl = $('cameraFps');
+
+    if (dot) dot.classList.remove('paused');
+    if (fpsEl) {
+      fpsEl.textContent = cameraFpsVal >= 1.0
+        ? `${cameraFpsVal.toFixed(1)} fps`
+        : `${(1 / Math.max(0.05, cameraFpsVal)).toFixed(1)}s/f`;
+    }
+
+    if (img && msg.data) {
+      img.src = 'data:image/' + (msg.format || 'jpeg') + ';base64,' + msg.data;
+      img.classList.remove('hidden');
+      if (placeholder) placeholder.classList.add('hidden');
+    }
+  }
+
   // ── Utilities ──────────────────────────────────────────────────────────────
   function fmt(v) { return typeof v === 'number' ? v.toFixed(2) : '—'; }
   function esc(s) {
@@ -951,6 +1028,7 @@
     initLayers();
     initCanvas();
     initControls();
+    initCamera();
     initWSEvents();
     setConnected(false);
     applyNavStatus(navStatus);

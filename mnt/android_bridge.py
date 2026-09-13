@@ -66,7 +66,7 @@ from std_msgs.msg import Bool, Empty, Float32
 from std_msgs.msg import String as RosString
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, CompressedImage
 from nav2_msgs.action import NavigateToPose
 import tf2_ros
 
@@ -132,6 +132,8 @@ class AndroidBridge(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("free_thresh", 25)
         self.declare_parameter("occupied_thresh", 65)
+        self.declare_parameter("camera_topic", "/camera/image_raw/compressed")
+        self.declare_parameter("camera_frame", "camera_link")
         self.declare_parameter(
             "objects_file",
             os.environ.get("OBJECTS_FILE", "/opt/droidal/objects.json"))
@@ -145,12 +147,15 @@ class AndroidBridge(Node):
         self.base_frame = self.get_parameter("base_frame").value
         self.free_thresh = int(self.get_parameter("free_thresh").value)
         self.occ_thresh = int(self.get_parameter("occupied_thresh").value)
+        camera_topic = self.get_parameter("camera_topic").value
+        self.camera_frame = self.get_parameter("camera_frame").value
         self.objects_path = self.get_parameter("objects_file").value
 
         self._explore_pub = self.create_publisher(Bool, "/explore/enable", QoSProfile(depth=1))
         self._cancel_pub = self.create_publisher(Empty, "/goal_pose/cancel", QoSProfile(depth=1))
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, QoSProfile(depth=1))
         self._goal_pub = self.create_publisher(PoseStamped, self.goal_topic, QoSProfile(depth=1))
+        self._camera_pub = self.create_publisher(CompressedImage, camera_topic, QoSProfile(depth=1))
 
         # Waypoint topic publishers
         self._wp_save_pub = self.create_publisher(RosString, "/waypoint/save", QoSProfile(depth=5))
@@ -162,6 +167,8 @@ class AndroidBridge(Node):
         self._latest_voltage = None
         self._latest_path = []
         self._latest_waypoints = {}
+        self._latest_camera_jpeg = None
+        self._latest_camera_stamp = 0.0
         self._explore_enabled = False
         self._lock = threading.Lock()
 
@@ -255,10 +262,12 @@ class AndroidBridge(Node):
             v = self._latest_voltage
             exp = self._explore_enabled
             nav = self.nav_status()
+            cam_active = (time.time() - self._latest_camera_stamp < 10.0) if self._latest_camera_stamp > 0 else False
         self._broadcast_event("telemetry", {
             "battery_v": v,
             "explore_enabled": exp,
-            "nav_status": nav
+            "nav_status": nav,
+            "camera_active": cam_active,
         })
 
     # --- HTTP fallback for plain GET requests (viz + map.png) ---------------
@@ -285,6 +294,27 @@ class AndroidBridge(Node):
                  "Content-Length": str(len(png)),
                  "Access-Control-Allow-Origin": "*"},
                 png,
+            )
+
+        elif path in ("/camera/latest.jpg", "/camera.jpg"):
+            with self._lock:
+                jpeg = self._latest_camera_jpeg
+            if jpeg is None:
+                body = b'{"error":"no camera frame yet"}'
+                return _http_response(
+                    http.HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"Content-Type": "application/json",
+                     "Content-Length": str(len(body)),
+                     "Access-Control-Allow-Origin": "*"},
+                    body,
+                )
+            return _http_response(
+                http.HTTPStatus.OK,
+                {"Content-Type": "image/jpeg",
+                 "Content-Length": str(len(jpeg)),
+                 "Access-Control-Allow-Origin": "*",
+                 "Cache-Control": "no-cache"},
+                jpeg,
             )
 
         static = _static_response(path)
@@ -344,6 +374,9 @@ class AndroidBridge(Node):
         if mtype == "command":
             self._handle_command(msg, peer)
 
+        elif mtype == "camera_frame":
+            self._handle_camera_frame(msg)
+
         elif mtype == "request":
             mid = msg.get("id", "")
             try:
@@ -365,6 +398,8 @@ class AndroidBridge(Node):
         elif command in ("freeze", "stop"):
             self._freeze()
             self.get_logger().info(f"[{peer[0]}] freeze")
+        elif command == "camera_frame":
+            self._handle_camera_frame(msg)
         elif command == "ping":
             self.get_logger().info(f"[{peer[0]}] ping")
         else:
@@ -375,6 +410,34 @@ class AndroidBridge(Node):
         self.cancel_goal()
         for _ in range(max(1, self.freeze_repeats)):
             self._cmd_vel_pub.publish(Twist())
+
+    def _handle_camera_frame(self, msg):
+        raw_b64 = msg.get("data")
+        if not raw_b64:
+            return
+        try:
+            raw_bytes = base64.b64decode(raw_b64)
+        except Exception as e:
+            self.get_logger().warning(f"failed to decode camera_frame base64: {e}")
+            return
+
+        stamp = float(msg.get("stamp", time.time()))
+        with self._lock:
+            self._latest_camera_jpeg = raw_bytes
+            self._latest_camera_stamp = stamp
+
+        img_msg = CompressedImage()
+        img_msg.header.stamp = self.get_clock().now().to_msg()
+        img_msg.header.frame_id = self.camera_frame
+        img_msg.format = str(msg.get("format", "jpeg"))
+        img_msg.data = raw_bytes
+        self._camera_pub.publish(img_msg)
+
+        self._broadcast_event("camera_frame", {
+            "data": raw_b64,
+            "format": img_msg.format,
+            "stamp": stamp,
+        })
 
     # --- Request handler ----------------------------------------------------
     def _handle_request(self, msg, peer):
@@ -417,10 +480,12 @@ class AndroidBridge(Node):
                     v = self._latest_voltage
                     exp = self._explore_enabled
                     nav = self.nav_status()
+                    cam_active = (time.time() - self._latest_camera_stamp < 10.0) if self._latest_camera_stamp > 0 else False
                 return {
                     "battery_v": v,
                     "explore_enabled": exp,
-                    "nav_status": nav
+                    "nav_status": nav,
+                    "camera_active": cam_active,
                 }
 
             elif path == "/explore/targets":

@@ -85,6 +85,25 @@
       <div id="empty" class="empty hidden">
         No map yet.<br>Start SLAM (mapping mode) and drive around.
       </div>
+
+      <!-- Floating Camera Feed Overlay -->
+      <div id="cameraFeed" class="camera-feed hidden">
+        <div class="camera-header">
+          <div class="camera-title-wrap">
+            <span class="camera-dot">●</span>
+            <span class="camera-title">Camera Feed</span>
+          </div>
+          <div class="camera-header-right">
+            <span id="cameraFps" class="camera-fps muted">--</span>
+            <button id="cameraClose" class="camera-close" title="Hide camera">×</button>
+          </div>
+        </div>
+        <div class="camera-view">
+          <img id="cameraImg" class="camera-img hidden" alt="Camera Feed" />
+          <div id="cameraPlaceholder" class="camera-placeholder muted">Waiting for stream…</div>
+        </div>
+      </div>
+
       <div class="click-hint">Left-click → navigate &nbsp;|&nbsp; Shift+drag / middle-drag → pan &nbsp;|&nbsp; Scroll → zoom &nbsp;|&nbsp; Right-click → cancel</div>
     </div>
 
