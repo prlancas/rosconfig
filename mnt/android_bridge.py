@@ -323,6 +323,49 @@ class AndroidBridge(Node):
                 jpeg,
             )
 
+        elif path == "/map.json":
+            meta = self.map_metadata()
+            if meta is None:
+                body = b'{"error":"no map available yet"}'
+                return _http_response(
+                    http.HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"Content-Type": "application/json",
+                     "Content-Length": str(len(body)),
+                     "Access-Control-Allow-Origin": "*",
+                     "Cache-Control": "no-cache"},
+                    body,
+                )
+            body = json.dumps(meta).encode("utf-8")
+            return _http_response(
+                http.HTTPStatus.OK,
+                {"Content-Type": "application/json",
+                 "Content-Length": str(len(body)),
+                 "Access-Control-Allow-Origin": "*",
+                 "Cache-Control": "no-cache"},
+                body,
+            )
+
+        elif path.startswith("/thumb/"):
+            oid = path[len("/thumb/"):]
+            data = self.thumb_bytes(oid)
+            if data is None:
+                body = b'{"error":"not found"}'
+                return _http_response(
+                    http.HTTPStatus.NOT_FOUND,
+                    {"Content-Type": "application/json",
+                     "Content-Length": str(len(body)),
+                     "Access-Control-Allow-Origin": "*"},
+                    body,
+                )
+            return _http_response(
+                http.HTTPStatus.OK,
+                {"Content-Type": "image/jpeg",
+                 "Content-Length": str(len(data)),
+                 "Access-Control-Allow-Origin": "*",
+                 "Cache-Control": "no-cache"},
+                data,
+            )
+
         static = _static_response(path)
         if static is not None:
             ctype, body = static
@@ -333,6 +376,32 @@ class AndroidBridge(Node):
                  "Cache-Control": "no-cache"},
                 body,
             )
+
+        # General GET endpoint fallback for REST / curl debugging (pose, objects, scan, etc.)
+        try:
+            peer = getattr(connection, "remote_address", ("http", 0))
+            res = self._handle_request({"method": "GET", "path": path}, peer)
+            body = json.dumps(res).encode("utf-8")
+            return _http_response(
+                http.HTTPStatus.OK,
+                {"Content-Type": "application/json",
+                 "Content-Length": str(len(body)),
+                 "Access-Control-Allow-Origin": "*",
+                 "Cache-Control": "no-cache"},
+                body,
+            )
+        except ValueError as e:
+            if "unknown GET path" not in str(e):
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+                return _http_response(
+                    http.HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"Content-Type": "application/json",
+                     "Content-Length": str(len(body)),
+                     "Access-Control-Allow-Origin": "*"},
+                    body,
+                )
+        except Exception as e:
+            self.get_logger().error(f"HTTP GET {path} error: {e}")
 
         body = b'{"error":"not found"}'
         return _http_response(

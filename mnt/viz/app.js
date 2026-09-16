@@ -156,7 +156,7 @@
   // We draw the map image at canvas position (panX, panY) with scale = mapPxScale * zoom.
 
   function worldToCanvas(wx, wy) {
-    if (!mapMeta) return { x: 0, y: 0 };
+    if (!mapMeta || !mapMeta.origin || typeof mapMeta.resolution !== 'number') return { x: 0, y: 0 };
     const col = (wx - mapMeta.origin.x) / mapMeta.resolution;
     const row = (mapMeta.height - 1) - (wy - mapMeta.origin.y) / mapMeta.resolution;
     return {
@@ -166,7 +166,7 @@
   }
 
   function canvasToWorld(cx, cy) {
-    if (!mapMeta) return null;
+    if (!mapMeta || !mapMeta.origin || typeof mapMeta.resolution !== 'number') return null;
     const col = (cx - panX) / (mapPxScale * zoom);
     const row = (cy - panY) / (mapPxScale * zoom);
     return {
@@ -183,10 +183,11 @@
   }
 
   function fitMap(force = false) {
-    if (!mapMeta || !mapImg) return;
+    if (!mapMeta || !mapMeta.width || !mapMeta.height || !mapImg) return;
     if (!force && hasFitOnce) return;
     const s = $('stage');
     const sw = s.clientWidth, sh = s.clientHeight;
+    if (sw === 0 || sh === 0) return;
     mapPxScale = Math.min(sw / mapMeta.width, sh / mapMeta.height);
     zoom = 1;
     panX = (sw - mapMeta.width  * mapPxScale) / 2;
@@ -197,7 +198,7 @@
   // ── Draw functions ─────────────────────────────────────────────────────────
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!mapMeta) return;
+    if (!mapMeta || !mapMeta.origin || typeof mapMeta.resolution !== 'number') return;
 
     const mapW = mapMeta.width  * mapPxScale * zoom;
     const mapH = mapMeta.height * mapPxScale * zoom;
@@ -389,7 +390,17 @@
   // ── Data refresh ───────────────────────────────────────────────────────────
   async function refreshMap() {
     try {
-      const meta = await fetch('/map.json').then(r => r.json());
+      let meta = null;
+      try {
+        meta = await ws.request('GET', '/map.json');
+      } catch {
+        const res = await fetch('/map.json');
+        if (!res.ok) throw new Error('map ' + res.status);
+        meta = await res.json();
+      }
+      if (!meta || meta.error || !meta.origin || typeof meta.resolution !== 'number') {
+        throw new Error(meta?.error || 'invalid map metadata');
+      }
       mapMeta = meta;
 
       const img = new Image();
@@ -402,7 +413,7 @@
       updateMapPixels();        // for door unexplored probe
       $('empty').classList.add('hidden');
     } catch {
-      if (!mapMeta) $('empty').classList.remove('hidden');
+      if (!mapMeta || !mapMeta.origin) $('empty').classList.remove('hidden');
     }
   }
 
@@ -477,7 +488,7 @@
 
   // ── Unknown-space probe (door "leads somewhere new") ───────────────────────
   function updateMapPixels() {
-    if (!mapImg || !mapMeta) return;
+    if (!mapImg || !mapMeta || !mapMeta.width || !mapMeta.height) return;
     const off = document.createElement('canvas');
     off.width = mapMeta.width; off.height = mapMeta.height;
     const oc = off.getContext('2d');
@@ -487,14 +498,14 @@
   }
 
   function nativeIsUnknown(col, row) {
-    if (!mapPixels) return false;
+    if (!mapPixels || !mapMeta) return false;
     const x = Math.round(col), y = Math.round(row);
     if (x < 0 || y < 0 || x >= mapMeta.width || y >= mapMeta.height) return false;
     return Math.abs(mapPixels.data[(y * mapMeta.width + x) * 4] - UNKNOWN_GRAY) < 10;
   }
 
   function doorHasUnexplored(obj) {
-    if (!mapMeta) return false;
+    if (!mapMeta || !mapMeta.origin || typeof mapMeta.resolution !== 'number') return false;
     const steps = Math.max(1, Math.round(DOOR_PROBE_M / mapMeta.resolution));
     for (let dx = -steps; dx <= steps; dx++) {
       for (let dy = -steps; dy <= steps; dy++) {
