@@ -1,0 +1,10 @@
+# Local-development overlay.  Use via `./run.sh dev …`; don't use this file on
+# the robot's production host.  Keep the image's /opt/droidal/launch directory
+# visible because the container command launches from there.  The DROIDAL_DIR
+# override makes that launch file use the mounted scripts and web UI instead.
+services:
+  droidal:
+    volumes:
+      - ./mnt:/workspace/mnt
+    environment:
+      DROIDAL_DIR: /workspace/mnt

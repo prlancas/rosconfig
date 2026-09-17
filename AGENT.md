@@ -104,8 +104,13 @@ was replaced by the compose + custom-image setup above.
 ## Common tasks
 
 - **Run locally:** `./run.sh` (wraps `docker compose up`). `./run.sh down` to stop.
-- **Live-edit scripts without rebuild:** uncomment the `./mnt:/opt/droidal`
-  bind mount in `docker-compose.yml`.
+- **Shell in the ROS container:** `./run.sh shell` (or `./run.sh dev shell`) opens
+  an interactive Bash shell with ROS sourced.
+- **Fast live-edit loop:** `./run.sh dev -d` mounts `./mnt` at
+  `/workspace/mnt` and points `DROIDAL_DIR` there (while retaining the baked
+  launch files), so script and visualiser edits need only
+  `./run.sh dev restart droidal`; use `./run.sh dev --build -d` only after
+  changing image-baked dependencies or the Dockerfile.
 - **Publish image:** push to `main` triggers `.github/workflows/docker-publish.yml`
   -> `ghcr.io/prlancas/droidalros`. Manual: `./push.sh` (after `docker login ghcr.io`).
 - **Validate compose:** `docker compose config`.

@@ -53,6 +53,8 @@
   let frontiers  = [];    // [{x, y, size, is_doorway}]
   let navStatus  = { status: 'IDLE', target: null, elapsed_s: 0 };
   let exploreEnabled = false;
+  let exploreSupported = null;
+  let slamMode = null;
   let batteryV   = null;
   let clickTarget = null;   // {x, y} world-coords of pending goal marker
   let selectedObjId = null;
@@ -84,6 +86,7 @@
       this._pending = new Map();
       this._handlers = {};
       this._backoff = 1000;
+      this._nextRequestId = 0;
       this._connect();
     }
 
@@ -127,7 +130,11 @@
         if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
           reject(new Error('not connected')); return;
         }
-        const id = crypto.randomUUID();
+        // The dashboard is intentionally served over LAN HTTP. `crypto.randomUUID`
+        // is only exposed in secure browser contexts, so it is absent in some
+        // browsers at http://192.168.x.x. Request IDs only need to be unique for
+        // this WebSocket client, not globally cryptographic.
+        const id = `web-${Date.now().toString(36)}-${(++this._nextRequestId).toString(36)}`;
         const timer = setTimeout(() => {
           this._pending.delete(id);
           reject(new Error('timeout'));
@@ -157,8 +164,13 @@
 
   function worldToCanvas(wx, wy) {
     if (!mapMeta || !mapMeta.origin || typeof mapMeta.resolution !== 'number') return { x: 0, y: 0 };
-    const col = (wx - mapMeta.origin.x) / mapMeta.resolution;
-    const row = (mapMeta.height - 1) - (wy - mapMeta.origin.y) / mapMeta.resolution;
+    // OccupancyGrid's origin may be rotated. Convert the world point into the
+    // grid's local axes before converting it to a PNG row/column.
+    const yaw = Number(mapMeta.origin.yaw) || 0;
+    const dx = wx - mapMeta.origin.x;
+    const dy = wy - mapMeta.origin.y;
+    const col = (Math.cos(yaw) * dx + Math.sin(yaw) * dy) / mapMeta.resolution;
+    const row = (mapMeta.height - 1) - (-Math.sin(yaw) * dx + Math.cos(yaw) * dy) / mapMeta.resolution;
     return {
       x: panX + col * mapPxScale * zoom,
       y: panY + row * mapPxScale * zoom,
@@ -169,9 +181,12 @@
     if (!mapMeta || !mapMeta.origin || typeof mapMeta.resolution !== 'number') return null;
     const col = (cx - panX) / (mapPxScale * zoom);
     const row = (cy - panY) / (mapPxScale * zoom);
+    const gx = col * mapMeta.resolution;
+    const gy = ((mapMeta.height - 1) - row) * mapMeta.resolution;
+    const yaw = Number(mapMeta.origin.yaw) || 0;
     return {
-      x: mapMeta.origin.x + col * mapMeta.resolution,
-      y: mapMeta.origin.y + ((mapMeta.height - 1) - row) * mapMeta.resolution,
+      x: mapMeta.origin.x + Math.cos(yaw) * gx - Math.sin(yaw) * gy,
+      y: mapMeta.origin.y + Math.sin(yaw) * gx + Math.cos(yaw) * gy,
     };
   }
 
@@ -388,6 +403,16 @@
   }
 
   // ── Data refresh ───────────────────────────────────────────────────────────
+  function clearMap() {
+    mapMeta = null;
+    mapImg = null;
+    mapPixels = null;
+    frontiers = [];
+    hasFitOnce = false;
+    $('frontierCount').textContent = '';
+    $('empty').classList.remove('hidden');
+  }
+
   async function refreshMap() {
     try {
       let meta = null;
@@ -395,6 +420,12 @@
         meta = await ws.request('GET', '/map.json');
       } catch {
         const res = await fetch('/map.json');
+        // A successful SLAM reset has no map until mapping produces the first
+        // grid. Clear the last image instead of leaving stale walls on screen.
+        if (res.status === 503) {
+          clearMap();
+          return;
+        }
         if (!res.ok) throw new Error('map ' + res.status);
         meta = await res.json();
       }
@@ -413,6 +444,8 @@
       updateMapPixels();        // for door unexplored probe
       $('empty').classList.add('hidden');
     } catch {
+      // Keep the last map for transient network errors. An explicit 503 above
+      // is the authoritative "no map" state after a reset.
       if (!mapMeta || !mapMeta.origin) $('empty').classList.remove('hidden');
     }
   }
@@ -426,7 +459,14 @@
         $('poseY').textContent   = `y: ${p.y.toFixed(3)} m`;
         $('poseYaw').textContent = `yaw: ${(p.yaw * 180 / Math.PI).toFixed(1)}°`;
       }
-    } catch { /* no TF yet */ }
+    } catch {
+      // A map can be available before slam_toolbox has established map→odom.
+      // Make that dependency visible instead of silently rendering no robot.
+      robotPose = null;
+      $('poseX').textContent = 'x: waiting for TF';
+      $('poseY').textContent = 'y: map → base_link unavailable';
+      $('poseYaw').textContent = 'yaw: —';
+    }
   }
 
   async function refreshPath() {
@@ -482,6 +522,11 @@
       if (!res) return;
       if (res.battery_v != null) { batteryV = res.battery_v; updateBattery(); }
       if (res.explore_enabled != null) { exploreEnabled = res.explore_enabled; updateExploreUI(); }
+      if (res.explore_supported != null) {
+        exploreSupported = res.explore_supported;
+        slamMode = res.slam_mode;
+        updateExploreUI();
+      }
       if (res.nav_status) applyNavStatus(res.nav_status);
     } catch {}
   }
@@ -554,6 +599,17 @@
   }
 
   function updateExploreUI() {
+    const on = $('btnExploreOn');
+    const off = $('btnExploreOff');
+    if (exploreSupported === false) {
+      $('exploreStatus').textContent = `Unavailable — SLAM is ${slamMode || 'not in mapping mode'}`;
+      $('exploreStatus').className = 'info-line mt-4 muted';
+      on.disabled = true;
+      off.disabled = true;
+      return;
+    }
+    on.disabled = false;
+    off.disabled = false;
     $('exploreStatus').textContent  = exploreEnabled ? '● Exploring' : 'Disabled';
     $('exploreStatus').className    = 'info-line mt-4 ' + (exploreEnabled ? 'ok' : 'muted');
   }
@@ -884,8 +940,17 @@
       const btn = $('btnSlamReset');
       btn.disabled = true;
       btn.textContent = '⏳ Resetting…';
-      try { await ws.request('POST', '/slam/reset', {}); }
-      catch {}
+      try {
+        const res = await ws.request('POST', '/slam/reset', {});
+        if (res?.result === 'ok') {
+          clearMap();
+          btn.textContent = slamMode === 'localization'
+            ? '✓ Reset — use mapping mode'
+            : '✓ Reset!';
+        } else {
+          btn.textContent = '✗ Failed';
+        }
+      } catch { btn.textContent = '✗ Error'; }
       setTimeout(() => { btn.disabled = false; btn.textContent = '↺ Reset Map'; }, 3000);
     });
 
@@ -907,6 +972,11 @@
     ws.on('telemetry', msg => {
       if (msg.battery_v != null)      { batteryV = msg.battery_v; updateBattery(); }
       if (msg.explore_enabled != null){ exploreEnabled = msg.explore_enabled; updateExploreUI(); }
+      if (msg.explore_supported != null) {
+        exploreSupported = msg.explore_supported;
+        slamMode = msg.slam_mode;
+        updateExploreUI();
+      }
       if (msg.nav_status)             applyNavStatus(msg.nav_status);
     });
     ws.on('open', () => {

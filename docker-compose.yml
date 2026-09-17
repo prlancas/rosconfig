@@ -35,7 +35,11 @@ services:
       #    growing as you drive -- this is the mode for auto-exploration (enable
       #    the explorer with `ros2 topic pub /explore/enable std_msgs/Bool
       #    "{data: true}"`). Save the result with slam_toolbox/serialize_map.
-      SLAM_MODE: "localization"
+      # Mapping is the normal operating mode: it lets Droidal build a fresh
+      # map while its app-directed explorer visits visual inspection points.
+      # Use `SLAM_MODE=localization ./run.sh …` to load and navigate a saved
+      # map without modifying it.
+      SLAM_MODE: "${SLAM_MODE:-mapping}"
       # Default: listen for the ESP32 raw-lidar TCP forwarder on :8080.
       LIDAR_TCP_PORT: "8080"
       # For a USB-UART adapter instead, comment the line above and set:

@@ -48,7 +48,6 @@ import json
 import math
 import os
 import struct
-import subprocess
 import threading
 import time
 import zlib
@@ -68,6 +67,8 @@ from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan, CompressedImage
 from nav2_msgs.action import NavigateToPose
+from slam_toolbox.srv import Reset as SlamReset
+from slam_toolbox.srv import SerializePoseGraph as SlamSerialize
 import tf2_ros
 
 VIZ_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viz")
@@ -126,7 +127,6 @@ class AndroidBridge(Node):
         self.declare_parameter("ws_port", 8791)
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("freeze_repeats", 5)
-        self.declare_parameter("goal_topic", "/move_base_simple/goal")
         self.declare_parameter("action_name", "navigate_to_pose")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
@@ -141,7 +141,6 @@ class AndroidBridge(Node):
         self.ws_port = int(self.get_parameter("ws_port").value)
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self.freeze_repeats = int(self.get_parameter("freeze_repeats").value)
-        self.goal_topic = self.get_parameter("goal_topic").value
         action_name = self.get_parameter("action_name").value
         self.map_frame = self.get_parameter("map_frame").value
         self.base_frame = self.get_parameter("base_frame").value
@@ -150,11 +149,13 @@ class AndroidBridge(Node):
         camera_topic = self.get_parameter("camera_topic").value
         self.camera_frame = self.get_parameter("camera_frame").value
         self.objects_path = self.get_parameter("objects_file").value
+        # Frontier exploration changes the map, so it is intentionally only
+        # available when slam_toolbox was launched in mapping mode.
+        self.slam_mode = os.environ.get("SLAM_MODE", "mapping").strip().lower()
 
         self._explore_pub = self.create_publisher(Bool, "/explore/enable", QoSProfile(depth=1))
         self._cancel_pub = self.create_publisher(Empty, "/goal_pose/cancel", QoSProfile(depth=1))
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, QoSProfile(depth=1))
-        self._goal_pub = self.create_publisher(PoseStamped, self.goal_topic, QoSProfile(depth=1))
         self._camera_pub = self.create_publisher(CompressedImage, camera_topic, QoSProfile(depth=1))
 
         # Waypoint topic publishers
@@ -172,7 +173,9 @@ class AndroidBridge(Node):
         self._explore_enabled = False
         self._lock = threading.Lock()
 
-        # Nav2 action client for direct goal tracking and status reporting.
+        # The dashboard talks to Nav2 directly.  Do not also publish the same
+        # goal to /move_base_simple/goal: goal_bridge subscribes there and would
+        # submit a second action goal which preempts this one.
         self._nav_client = ActionClient(self, NavigateToPose, action_name)
         self._nav_goal_handle = None
         self._nav_status = "IDLE"  # IDLE, NAVIGATING, SUCCEEDED, ABORTED, CANCELED
@@ -206,6 +209,10 @@ class AndroidBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
         )
         self.create_subscription(RosString, "/waypoint/list", self._on_waypoint_list, wp_qos)
+
+        # Service clients for slam_toolbox (avoid shelling out ros2 CLI; env may not be sourced)
+        self._slam_reset_client = self.create_client(SlamReset, "/slam_toolbox/reset")
+        self._slam_serialize_client = self.create_client(SlamSerialize, "/slam_toolbox/serialize_map")
 
         self.objects = self._load_objects()
 
@@ -468,6 +475,12 @@ class AndroidBridge(Node):
         command = str(msg.get("command", "")).lower()
         if command == "explore":
             enable = bool(msg.get("enable", False))
+            if enable and self.slam_mode != "mapping":
+                self.get_logger().warning(
+                    f"[{peer[0]}] ignored explore enable: SLAM_MODE={self.slam_mode!r}; "
+                    "restart in mapping mode to explore")
+                self._explore_pub.publish(Bool(data=False))
+                return
             self._explore_pub.publish(Bool(data=enable))
             self.get_logger().info(f"[{peer[0]}] explore -> {enable}")
         elif command in ("freeze", "stop"):
@@ -559,6 +572,8 @@ class AndroidBridge(Node):
                 return {
                     "battery_v": v,
                     "explore_enabled": exp,
+                    "explore_supported": self.slam_mode == "mapping",
+                    "slam_mode": self.slam_mode,
                     "nav_status": nav,
                     "camera_active": cam_active,
                 }
@@ -713,12 +728,21 @@ class AndroidBridge(Node):
             }
 
     def publish_goal(self, x, y, yaw=0.0):
+        if not self._nav_client.wait_for_server(timeout_sec=1.0):
+            with self._lock:
+                self._nav_status = "UNAVAILABLE"
+                self._nav_target = None
+                self._nav_start_time = 0.0
+            self._broadcast_event("nav_status", {
+                "status": "UNAVAILABLE", "target": None,
+            })
+            raise ValueError("Nav2 is not ready; wait for navigation to start")
+
         with self._lock:
             self._nav_status = "NAVIGATING"
             self._nav_target = {"x": float(x), "y": float(y), "yaw": float(yaw)}
             self._nav_start_time = time.time()
 
-        # 1. Publish to /move_base_simple/goal (for Foxglove/goal_bridge compatibility)
         goal = PoseStamped()
         goal.header.frame_id = self.map_frame
         goal.header.stamp = self.get_clock().now().to_msg()
@@ -726,14 +750,10 @@ class AndroidBridge(Node):
         goal.pose.position.y = float(y)
         goal.pose.orientation.z = math.sin(float(yaw) / 2.0)
         goal.pose.orientation.w = math.cos(float(yaw) / 2.0)
-        self._goal_pub.publish(goal)
-
-        # 2. Also send directly via ActionClient if available for tracking
-        if self._nav_client.wait_for_server(timeout_sec=0.5):
-            nav_goal = NavigateToPose.Goal()
-            nav_goal.pose = goal
-            send_future = self._nav_client.send_goal_async(nav_goal)
-            send_future.add_done_callback(self._on_goal_response)
+        nav_goal = NavigateToPose.Goal()
+        nav_goal.pose = goal
+        send_future = self._nav_client.send_goal_async(nav_goal)
+        send_future.add_done_callback(self._on_goal_response)
 
         self._broadcast_event("nav_status", {"status": "NAVIGATING", "target": self._nav_target})
         self.get_logger().info(f"goal -> x={x:.2f} y={y:.2f} yaw={yaw:.2f}")
@@ -778,47 +798,74 @@ class AndroidBridge(Node):
         self._broadcast_event("nav_status", {"status": "CANCELED", "target": target})
         self.get_logger().info("goal cancel")
 
+    def _call_service_sync(self, client, request, timeout_sec=10.0):
+        """Call a ROS 2 service synchronously from a non-executor thread.
+
+        Creates a temporary SingleThreadedExecutor, spins it until the future
+        resolves or the timeout expires, then tears it down.  Safe to call from
+        the WebSocket handler thread because rclpy service clients are
+        thread-safe for ``call_async``; the temporary executor only handles
+        that one future.
+        """
+        if not client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warning(
+                f"service {client.srv_name} not available (waited 2 s)")
+            return None
+        future = client.call_async(request)
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        try:
+            deadline = time.monotonic() + timeout_sec
+            while not future.done():
+                if time.monotonic() > deadline:
+                    self.get_logger().warning(
+                        f"service {client.srv_name} timed out after {timeout_sec} s")
+                    return None
+                executor.spin_once(timeout_sec=0.1)
+        finally:
+            executor.remove_node(self)
+            executor.shutdown(timeout_sec=0)
+        return future.result()
+
     def slam_save_map(self):
         """Call slam_toolbox serialize_map service to save the map."""
-        map_path = os.path.splitext(self.objects_path)[0] if self.objects_path else "/opt/droidal/droidal_map"
-        # default target is /opt/droidal/droidal_map
         save_target = "/opt/droidal/droidal_map"
-        cmd = [
-            "ros2", "service", "call",
-            "/slam_toolbox/serialize_map",
-            "slam_toolbox/srv/SerializePoseGraph",
-            f"{{filename: '{save_target}'}}"
-        ]
+        req = SlamSerialize.Request()
+        req.filename = save_target
         self.get_logger().info(f"calling slam serialize_map -> {save_target}")
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if res.returncode == 0:
-                self.get_logger().info("slam map saved successfully")
-                return True
-            else:
-                self.get_logger().warning(f"slam map save error: {res.stderr}")
+            resp = self._call_service_sync(self._slam_serialize_client, req)
+            if resp is None:
+                self.get_logger().warning("slam map save: no response from service")
                 return False
+            self.get_logger().info(f"slam map saved: result={resp.result}")
+            return True
         except Exception as e:
             self.get_logger().error(f"slam map save exception: {e}")
             return False
 
     def slam_reset_map(self):
         """Call slam_toolbox reset service to start mapping fresh."""
-        cmd = [
-            "ros2", "service", "call",
-            "/slam_toolbox/reset",
-            "slam_toolbox/srv/Reset",
-            "{pause_new_measurements: false}"
-        ]
+        req = SlamReset.Request()
+        req.pause_new_measurements = False
         self.get_logger().info("calling slam reset")
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if res.returncode == 0:
-                self.get_logger().info("slam reset successfully")
-                return True
-            else:
-                self.get_logger().warning(f"slam reset error: {res.stderr}")
+            resp = self._call_service_sync(self._slam_reset_client, req)
+            if resp is None:
+                self.get_logger().warning("slam reset: no response from service")
                 return False
+            self.get_logger().info("slam reset successfully")
+            # A new SLAM map has a new coordinate frame. Clear map-bound host
+            # landmarks as well, otherwise old object/door pins would steer
+            # the next exploration run toward stale coordinates.
+            with self._lock:
+                self._latest_map = None
+                self.objects = []
+            self._save_objects()
+            # The Android app owns detailed room/object memory. Let connected
+            # phones discard only that spatial data before fresh mapping begins.
+            self._broadcast_event("map_reset", {})
+            return True
         except Exception as e:
             self.get_logger().error(f"slam reset exception: {e}")
             return False

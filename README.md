@@ -39,12 +39,44 @@ here is graphical, so the heavy RViz/GUI stack is omitted.
 ./run.sh              # foreground (Ctrl-C to stop)
 ./run.sh -d           # background
 ./run.sh logs -f      # follow logs
+./run.sh shell        # interactive ROS-enabled Bash shell in droidal
 ./run.sh down         # stop & remove
 ```
 
 `run.sh` is just a thin wrapper around `docker compose`. The first run builds
 the image locally (or pulls it from GHCR if you've published it). To always
 pull the published image instead of building, run `docker compose pull` first.
+
+### Fast local development
+
+Use the development overlay when testing changes on this machine:
+
+```bash
+./run.sh dev -d             # use local mnt/ files, no image rebuild
+./run.sh dev restart droidal  # reload changed Python/launch/web files
+./run.sh dev --build -d     # only after Dockerfile or requirements changes
+./run.sh dev logs -f droidal
+./run.sh dev shell
+./run.sh dev down
+```
+
+`dev` bind-mounts `./mnt` at `/workspace/mnt` and points `DROIDAL_DIR` there,
+while retaining the image's launch files at `/opt/droidal/launch`. It never
+needs a GitHub build to test changes to the ROS scripts or web visualiser, and
+is intended for local development rather than the production robot host.
+
+### Mapping and Droidal exploration
+
+The default is `SLAM_MODE=mapping`, so a **Reset Map** starts a genuinely new
+live map and exploration can extend it. Ask Droidal to start exploring; the
+phone app selects frontier and wall-inspection goals, navigates with Nav2, and
+captures/VLM-analyses a frame at each stop to record rooms and object landmarks.
+
+For read-only navigation on an existing saved map instead, start the stack with:
+
+```bash
+SLAM_MODE=localization ./run.sh dev -d
+```
 
 ### Choosing the LIDAR source
 
